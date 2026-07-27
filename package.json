@@ -1,0 +1,45 @@
+{
+  "name": "@platform/paperclip-plugin-vault",
+  "version": "0.1.3",
+  "packageManager": "pnpm@10.33.4",
+  "type": "module",
+  "private": true,
+  "description": "Per-call secret resolution against the Platform Vaultwarden vault. Resolves vault://<org>/<collection>/<item> references from a manifest-declared allowList without caching plaintext on disk.",
+  "scripts": {
+    "build": "node ./esbuild.config.mjs",
+    "postbuild": "npm run check:manifest-version",
+    "dev": "node ./esbuild.config.mjs --watch",
+    "test": "vitest run --config ./vitest.config.ts",
+    "typecheck": "tsc --noEmit",
+    "validate:manifest": "node ./scripts/validate-manifest.mjs",
+    "check:manifest-version": "node ./scripts/check-manifest-version.mjs",
+    "prepack": "npm run build && npm run validate:manifest"
+  },
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "keywords": [
+    "paperclip",
+    "plugin",
+    "secrets",
+    "vault",
+    "vaultwarden",
+    "bitwarden"
+  ],
+  "author": "Platform",
+  "license": "MIT",
+  "devDependencies": {
+    "@paperclipai/plugin-sdk": "file:.paperclip-sdk/paperclipai-plugin-sdk-2026.428.1-fork.11.tgz",
+    "@paperclipai/shared": "file:.paperclip-sdk/paperclipai-shared-2026.428.1-fork.11.tgz",
+    "@types/node": "^24.6.0",
+    "esbuild": "^0.27.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.5"
+  }
+}
