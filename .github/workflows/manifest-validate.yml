@@ -1,0 +1,68 @@
+name: Plugin manifest validation (release gate)
+
+# Release-time check that runs the host plugin-manifest validator against the
+# built dist/manifest.js before a tarball can be packed or published. This
+# plugin resolves secrets per call, so a manifest or packaging regression that
+# only surfaces at install time on a live host is the failure mode this gate
+# exists to prevent.
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/validate-manifest.mjs'
+      - 'scripts/check-manifest-version.mjs'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'esbuild.config.mjs'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - '.paperclip-sdk/**'
+      - '.github/workflows/manifest-validate.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'scripts/validate-manifest.mjs'
+      - 'scripts/check-manifest-version.mjs'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'esbuild.config.mjs'
+      - 'tsconfig.json'
+      - 'vitest.config.ts'
+      - '.paperclip-sdk/**'
+      - '.github/workflows/manifest-validate.yml'
+
+jobs:
+  validate-manifest:
+    name: validate dist/manifest.js against pluginManifestV1Schema
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.4
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm run typecheck
+      - name: Build manifest and worker
+        run: pnpm run build
+      - name: Unit tests
+        run: pnpm exec vitest run --config ./vitest.config.ts
+      - name: Validate built manifest
+        run: pnpm run validate:manifest
+      - name: Check manifest.version == package.json.version
+        run: pnpm run check:manifest-version
