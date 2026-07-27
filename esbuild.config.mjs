@@ -15,12 +15,23 @@ const define = {
 const presets = createPluginBundlerPresets({});
 const watch = process.argv.includes("--watch");
 
+// The SDK preset defaults to `sourcemap: true`, which inlines every original
+// TypeScript file the bundle pulls in — this plugin plus the vendored
+// @paperclipai/shared and plugin-sdk fork source — into `dist/*.map`.
+// `package.json` ships `dist` verbatim, so those maps would land in the packed
+// tarball. "external" keeps the map on disk for local debugging but drops the
+// sourcemap footer; the `files` negation keeps `dist/**/*.map` out of the
+// package.
+const sourcemap = "external";
+
 const workerCtx = await esbuild.context({
   ...presets.esbuild.worker,
+  sourcemap,
   define: { ...(presets.esbuild.worker.define ?? {}), ...define },
 });
 const manifestCtx = await esbuild.context({
   ...presets.esbuild.manifest,
+  sourcemap,
   define: { ...(presets.esbuild.manifest.define ?? {}), ...define },
 });
 

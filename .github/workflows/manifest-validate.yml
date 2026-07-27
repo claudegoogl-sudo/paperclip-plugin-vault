@@ -66,3 +66,7 @@ jobs:
         run: pnpm run validate:manifest
       - name: Check manifest.version == package.json.version
         run: pnpm run check:manifest-version
+      # Also covered by "Unit tests" above; named separately so the packaging
+      # gate is legible in the checks list and cannot be lost in a suite change.
+      - name: Assert the packed tarball ships no sourcemaps
+        run: pnpm exec vitest run --config ./vitest.config.ts tests/no-published-sourcemaps.spec.ts
