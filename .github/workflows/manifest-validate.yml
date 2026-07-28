@@ -12,6 +12,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/validate-manifest.mjs'
+      - 'scripts/check-source-hygiene.mjs'
       - 'scripts/check-manifest-version.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
@@ -28,6 +29,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'scripts/validate-manifest.mjs'
+      - 'scripts/check-source-hygiene.mjs'
       - 'scripts/check-manifest-version.mjs'
       - 'package.json'
       - 'pnpm-lock.yaml'
@@ -56,6 +58,8 @@ jobs:
           cache: 'pnpm'
           cache-dependency-path: pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
+      - name: Check source hygiene (no internal ticket ids / namespace strings)
+        run: pnpm run check:source-hygiene
       - name: Typecheck
         run: pnpm run typecheck
       - name: Build manifest and worker
