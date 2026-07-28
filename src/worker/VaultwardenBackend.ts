@@ -22,6 +22,7 @@ import {
   type VaultListItem,
 } from "./VaultBackend.js";
 import type { VaultRef } from "./secretRef.js";
+import { validateVaultServerUrl } from "./validateVaultServerUrl.js";
 
 /**
  * Bitwarden / Vaultwarden REST + crypto client.
@@ -101,6 +102,12 @@ export interface VaultwardenBackendOptions {
   deviceIdentifier?: string;
   /** Override `fetch` (tests). */
   fetchImpl?: typeof fetch;
+  /**
+   * Operator-configurable host allowlist for `serverUrl` (PLA safety
+   * follow-up). When omitted or empty, defaults to the single host parsed
+   * out of `serverUrl` itself — see `validateVaultServerUrl.ts`.
+   */
+  allowedServerHosts?: string[];
 }
 
 interface PreloginResponse {
@@ -170,13 +177,25 @@ export class VaultwardenBackend implements VaultBackend {
   private session: UnlockedSession | null = null;
   private readonly fetchImpl: typeof fetch;
   private readonly deviceIdentifier: string;
+  /**
+   * Canonical, validated form of `opts.serverUrl` — WHATWG-parsed once here
+   * rather than re-parsed from the raw string on every request, so the
+   * scoping check in {@link request} can never disagree with what was
+   * validated at construction time.
+   */
+  private readonly serverUrl: URL;
 
   constructor(private readonly opts: VaultwardenBackendOptions) {
-    if (!/^https:\/\//.test(opts.serverUrl)) {
+    // Strict WHATWG URL parse + host allowlist (default: the configured
+    // host only) — never a regex/prefix check on the raw string. See
+    // validateVaultServerUrl.ts for why a substring check is insufficient.
+    const validated = validateVaultServerUrl(opts.serverUrl, opts.allowedServerHosts);
+    if (!validated.ok) {
       throw new VaultAuthError(
-        `serverUrl must be https (got ${JSON.stringify(opts.serverUrl)})`,
+        `serverUrl rejected (${validated.reason}); host=${validated.host ?? "<unparseable>"}`,
       );
     }
+    this.serverUrl = validated.url;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
     this.deviceIdentifier = opts.deviceIdentifier ?? randomUUID();
   }
@@ -546,7 +565,7 @@ export class VaultwardenBackend implements VaultBackend {
       bearer?: string;
     },
   ): Promise<T> {
-    const url = new URL(path, this.opts.serverUrl).toString();
+    const url = this.scopedUrl(path).toString();
     const headers: Record<string, string> = { ...(opts.headers ?? {}) };
     if (opts.bearer) headers.authorization = `Bearer ${opts.bearer}`;
     const res = await this.fetchImpl(url, {
@@ -571,6 +590,26 @@ export class VaultwardenBackend implements VaultBackend {
       );
     }
     return (await res.json()) as T;
+  }
+
+  /**
+   * Build a request URL relative to the validated `serverUrl` and assert
+   * the final origin matches. All call sites in this class pass a fixed
+   * literal path today, but resolving against the raw config string on
+   * every call (the pre-fix behavior) left no structural guard against a
+   * future call site that builds `path` from server-supplied data — an
+   * absolute or protocol-relative `path` would otherwise silently redirect
+   * the request (and any bearer token attached to it) off-host. Mirrors
+   * MoonrakerClient.scopedUrl in paperclip-klipper.
+   */
+  private scopedUrl(path: string): URL {
+    const url = new URL(path, this.serverUrl);
+    if (url.host !== this.serverUrl.host || url.protocol !== this.serverUrl.protocol) {
+      throw new VaultBackendError(
+        `vault request path resolved outside the configured server (got host=${url.host}, expected host=${this.serverUrl.host})`,
+      );
+    }
+    return url;
   }
 }
 
