@@ -49,7 +49,19 @@ const manifest: PaperclipPluginManifestV1 = {
         default: "https://vault.timms-gitclaw.de",
         description:
           "Vaultwarden base URL. All identity + cipher requests are scoped " +
-          "to this host; the worker rejects URLs that don't match.",
+          "to this host; the worker rejects URLs that don't match. Rejected " +
+          "at worker setup (fail closed) if it is not https or its host is " +
+          "not in allowedServerHosts.",
+      },
+      allowedServerHosts: {
+        type: "array",
+        items: { type: "string" },
+        minItems: 1,
+        description:
+          "Optional host allowlist for serverUrl. Defaults to the single " +
+          "host parsed out of serverUrl itself, so most operators never " +
+          "need to set this. Set explicitly to pin the plugin to a " +
+          "specific host regardless of what serverUrl later resolves to.",
       },
       serviceAccountEmail: {
         type: "string",

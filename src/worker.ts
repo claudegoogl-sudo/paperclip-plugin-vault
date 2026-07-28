@@ -6,6 +6,12 @@ import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
 
 interface VaultConfig {
   serverUrl?: string;
+  /**
+   * Operator-configurable host allowlist for `serverUrl` (PLA safety
+   * follow-up). When omitted or empty, defaults to the single host parsed
+   * out of `serverUrl` itself. See `worker/validateVaultServerUrl.ts`.
+   */
+  allowedServerHosts?: string[];
   serviceAccountEmail?: string;
   masterPasswordRef?: string;
   allowList?: string[];
@@ -73,25 +79,51 @@ export async function createVaultWorker(
     return { backend: null };
   }
 
-  const backend =
-    options.backendOverride ??
-    new VaultwardenBackend({
-      serverUrl: rawConfig.serverUrl ?? DEFAULT_SERVER_URL,
-      email: rawConfig.serviceAccountEmail!,
-      // The SDK types require a dispatch runId, but the host ALSO supports
-      // worker-lifetime calls (service-context branch): with runId
-      // omitted, the server back-fills the plugin's own service-scope runId
-      // and authorizes against the secret's owning company. Session priming
-      // (no active dispatch) relies on that path, hence the cast.
-      resolvePassword: (runId) =>
-        runId === undefined
-          ? (
-              ctx.secrets.resolve as unknown as (ref: string) => Promise<string>
-            )(rawConfig.masterPasswordRef!)
-          : ctx.secrets.resolve(rawConfig.masterPasswordRef!, runId),
-      http: ctx.http,
-      logger: ctx.logger,
-    });
+  let backend: VaultBackend;
+  if (options.backendOverride) {
+    backend = options.backendOverride;
+  } else {
+    try {
+      backend = new VaultwardenBackend({
+        serverUrl: rawConfig.serverUrl ?? DEFAULT_SERVER_URL,
+        allowedServerHosts: rawConfig.allowedServerHosts,
+        email: rawConfig.serviceAccountEmail!,
+        // The SDK types require a dispatch runId, but the host ALSO supports
+        // worker-lifetime calls (service-context branch): with runId
+        // omitted, the server back-fills the plugin's own service-scope runId
+        // and authorizes against the secret's owning company. Session priming
+        // (no active dispatch) relies on that path, hence the cast.
+        resolvePassword: (runId) =>
+          runId === undefined
+            ? (
+                ctx.secrets.resolve as unknown as (ref: string) => Promise<string>
+              )(rawConfig.masterPasswordRef!)
+            : ctx.secrets.resolve(rawConfig.masterPasswordRef!, runId),
+        http: ctx.http,
+        logger: ctx.logger,
+      });
+    } catch (err) {
+      // Fail closed and loudly (PLA safety follow-up): a serverUrl that
+      // fails validation (bad scheme, unparseable, or host outside
+      // allowedServerHosts) must never reach a constructed backend — the
+      // master-password resolve must never even be attempted against it.
+      // The thrown error's message carries the rejected reason + host
+      // only (see VaultwardenBackend's constructor), never the raw
+      // serverUrl and never a credential.
+      ctx.logger.warn(
+        "vault plugin rejected serverUrl — tool calls will return prerequisite_missing until this is fixed",
+        { error: String(err instanceof Error ? err.message : err) },
+      );
+      registerVaultTools(ctx, {
+        backend: makeUnconfiguredBackend(),
+        allowList: [],
+        writeAudit: makeActivityAudit(ctx),
+        logger: ctx.logger,
+        handleMode,
+      });
+      return { backend: null };
+    }
+  }
 
   // Session lifecycle: prime the unlocked session from THIS worker-lifetime
   // context so the master-password resolve runs under the plugin's own
