@@ -24,14 +24,25 @@ const watch = process.argv.includes("--watch");
 // package.
 const sourcemap = "external";
 
+// Source comments carry internal engineering context (tracker ids, design
+// notes) that has no business in a published artifact. esbuild's
+// `legalComments` only governs license/@preserve banners, so it does not
+// help here; `minifyWhitespace` drops every ordinary comment while leaving
+// identifier names intact. Names matter: the post-build gates in
+// `scripts/` re-parse the emitted bundles, so full `minify` would buy
+// nothing and risk breaking them.
+const minifyWhitespace = true;
+
 const workerCtx = await esbuild.context({
   ...presets.esbuild.worker,
   sourcemap,
+  minifyWhitespace,
   define: { ...(presets.esbuild.worker.define ?? {}), ...define },
 });
 const manifestCtx = await esbuild.context({
   ...presets.esbuild.manifest,
   sourcemap,
+  minifyWhitespace,
   define: { ...(presets.esbuild.manifest.define ?? {}), ...define },
 });
 
