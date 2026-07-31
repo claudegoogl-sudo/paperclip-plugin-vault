@@ -51,9 +51,12 @@ import { validateVaultServerUrl } from "./validateVaultServerUrl.js";
  *   - Decrypted cipher values are returned from {@link read} and never
  *     stored on the client.
  *
- * **Outbound scoping**: all requests target the configured `serverUrl`.
- * The host enforces `http.outbound` on the configured base; we do not
- * permit cross-host redirects.
+ * **Outbound scoping**: all requests target the configured `serverUrl` and
+ * go through `ctx.http` (the host-mediated client), never a bare `fetch`.
+ * That means the host's SSRF hardening (protocol allowlist, private-IP
+ * filtering, DNS pinning) and the `http.outbound` capability gate both apply
+ * to every Vaultwarden request; `scopedUrl` below is a second, structural
+ * guard on top, not a substitute for host enforcement.
  */
 
 /**
@@ -100,7 +103,12 @@ export interface VaultwardenBackendOptions {
   logger: PluginLogger;
   /** Deterministic UUID for the device identifier (tests). */
   deviceIdentifier?: string;
-  /** Override `fetch` (tests). */
+  /**
+   * Override the transport entirely, bypassing `http` (tests only). The
+   * production default is `http.fetch` (see {@link FetchLike}); this exists
+   * so unit tests can stub raw HTTP without standing up a `PluginHttpClient`.
+   * Never set this outside tests — it skips the host's SSRF validation.
+   */
   fetchImpl?: typeof fetch;
   /**
    * Operator-configurable host allowlist for `serverUrl` (PLA safety
@@ -173,9 +181,21 @@ interface UnlockedSession {
   ciphers: SyncCipher[];
 }
 
+/**
+ * The exact shape {@link VaultwardenBackend.request} calls its transport
+ * with — deliberately narrower than both `RequestInit` and
+ * `PluginHttpFetchInit` so either a raw `fetch` (tests) or
+ * `PluginHttpClient.fetch` (production) can serve as `fetchImpl` without an
+ * adapter at the call site.
+ */
+type FetchLike = (
+  url: string,
+  init: { method: "GET" | "POST"; headers: Record<string, string>; body?: string },
+) => Promise<Response>;
+
 export class VaultwardenBackend implements VaultBackend {
   private session: UnlockedSession | null = null;
-  private readonly fetchImpl: typeof fetch;
+  private readonly fetchImpl: FetchLike;
   private readonly deviceIdentifier: string;
   /**
    * Canonical, validated form of `opts.serverUrl` — WHATWG-parsed once here
@@ -196,7 +216,10 @@ export class VaultwardenBackend implements VaultBackend {
       );
     }
     this.serverUrl = validated.url;
-    this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+    // Production default is the host-mediated client (SSRF-validated,
+    // capability-gated, audit-logged); `fetchImpl` is a raw-`fetch` test
+    // seam only (see the option's doc comment).
+    this.fetchImpl = opts.fetchImpl ?? ((url, init) => opts.http.fetch(url, init));
     this.deviceIdentifier = opts.deviceIdentifier ?? randomUUID();
   }
 
