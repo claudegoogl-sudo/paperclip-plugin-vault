@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "validate:manifest": "node ./scripts/validate-manifest.mjs",
     "check:manifest-version": "node ./scripts/check-manifest-version.mjs",
+    "check:source-hygiene": "node ./scripts/check-source-hygiene.mjs",
     "prepack": "npm run build && npm run validate:manifest"
   },
   "paperclipPlugin": {
