@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   registerVaultTools,
   type AuditRow,
+  type VaultToolDependencies,
 } from "../src/worker/registerTools.js";
 import {
   InMemoryVaultBackend,
@@ -10,6 +11,42 @@ import {
   type VaultBackend,
   type VaultListItem,
 } from "../src/worker/VaultBackend.js";
+
+/**
+ * This suite exercises `registerVaultTools`'s read/list/audit/policy logic
+ * against a FIXED backend + config snapshot per test (live-reread-per-dispatch
+ * behavior itself is covered separately in
+ * `tests/worker/liveConfigReread.spec.ts`). `resolveRuntime` is still called
+ * fresh on every dispatch here, exactly like production — it just always
+ * resolves to the same values, which is a faithful stand-in for "config
+ * hasn't changed between calls" rather than a captured-at-registration value.
+ */
+interface StaticRuntimeDeps {
+  backend: VaultBackend;
+  allowList: readonly string[];
+  writeAudit: (entry: AuditRow) => Promise<void>;
+  logger: VaultToolDependencies["logger"];
+  handleMode?: boolean;
+  companyPolicies?: Record<
+    string,
+    { allowList?: readonly string[]; handleMode?: boolean }
+  >;
+}
+
+function withStaticRuntime(deps: StaticRuntimeDeps): VaultToolDependencies {
+  const { backend, allowList, handleMode, companyPolicies, writeAudit, logger } = deps;
+  return {
+    resolveRuntime: async () => ({
+      ok: true,
+      backend,
+      allowList,
+      handleMode: handleMode ?? false,
+      companyPolicies,
+    }),
+    writeAudit,
+    logger,
+  };
+}
 
 interface RegisteredTool {
   declaration: unknown;
@@ -60,12 +97,12 @@ describe("vault.read tool", () => {
       { org: "EXAMPLE", collection: "svc-secrets", item: "tunnel-cert" },
       "tunnel-token-1234",
     );
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/tunnel-cert"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert" },
@@ -99,12 +136,12 @@ describe("vault.read tool", () => {
         return [];
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/tunnel-cert"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/api-tokens/board" },
@@ -129,12 +166,12 @@ describe("vault.read tool", () => {
         return [];
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler({ secretRef: "not-a-vault-ref" }, runCtx);
     expect(result.error).toMatch(/^invalid_ref/);
@@ -145,12 +182,12 @@ describe("vault.read tool", () => {
   it("returns not_found when the backend can't resolve the ref", async () => {
     const { ctx, tools, audits } = makeFakeCtx();
     const backend = new InMemoryVaultBackend();
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/svc-secrets/missing" },
@@ -167,12 +204,12 @@ describe("vault.read tool", () => {
       { org: "EXAMPLE", collection: "svc-secrets", item: "shh" },
       "super-secret-XYZ-987",
     );
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/shh"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     await tool.handler({ secretRef: "vault://EXAMPLE/svc-secrets/shh" }, runCtx);
     for (const row of audits) {
@@ -202,13 +239,13 @@ describe("vault.read handle mode", () => {
         return "handle://opaque-xyz";
       },
     });
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend: backendWith(PLAINTEXT),
       allowList: [ALLOWED],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
       handleMode: true,
-    });
+    }));
     const result = await tools.get("vault.read")!.handler({ secretRef: ALLOWED }, runCtx);
 
     expect(result.content).toBe("handle://opaque-xyz");
@@ -226,13 +263,13 @@ describe("vault.read handle mode", () => {
         throw new Error("host refused to mint");
       },
     });
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend: backendWith(PLAINTEXT),
       allowList: [ALLOWED],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
       handleMode: true,
-    });
+    }));
     const result = await tools.get("vault.read")!.handler({ secretRef: ALLOWED }, runCtx);
 
     expect(result.error).toMatch(/^error: mint_failed/);
@@ -252,13 +289,13 @@ describe("vault.read handle mode", () => {
         return "handle://should-not-happen";
       },
     });
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend: backendWith(PLAINTEXT),
       allowList: [ALLOWED],
       writeAudit: async () => {},
       logger: ctx.logger,
       // handleMode omitted → defaults off
-    });
+    }));
     const result = await tools.get("vault.read")!.handler({ secretRef: ALLOWED }, runCtx);
 
     expect(result.content).toBe(PLAINTEXT);
@@ -279,12 +316,12 @@ describe("vault.list tool", () => {
       { org: "EXAMPLE", collection: "svc-secrets", item: "b" },
       "secret-b",
     );
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
       writeAudit: async () => {},
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.list")!;
     const result = await tool.handler(
       { collectionGlob: "vault://EXAMPLE/svc-secrets/*" },
@@ -299,12 +336,12 @@ describe("vault.list tool", () => {
   it("denies a list filter outside the allowList", async () => {
     const { ctx, tools } = makeFakeCtx();
     const backend = new InMemoryVaultBackend();
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
       writeAudit: async () => {},
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.list")!;
     const result = await tool.handler(
       { collectionGlob: "vault://OTHER/svc-secrets/*" },
@@ -322,12 +359,12 @@ describe("vault.list tool", () => {
     backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "allowed-b" }, "y");
     backend.set({ org: "EXAMPLE", collection: "api-tokens", item: "off-scope" }, "z");
     backend.set({ org: "OTHER", collection: "svc-secrets", item: "other-org" }, "w");
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
       writeAudit: async () => {},
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.list")!;
     const result = await tool.handler({}, runCtx);
     const names = (result.data as { names: string[] }).names;
@@ -341,12 +378,12 @@ describe("vault.list tool", () => {
     const { ctx, tools, audits } = makeFakeCtx();
     const backend = new InMemoryVaultBackend();
     backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "a" }, "secret");
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.list")!;
     await tool.handler({ collectionGlob: "vault://EXAMPLE/svc-secrets/*" }, runCtx);
     expect(audits).toEqual([
@@ -364,12 +401,12 @@ describe("vault.list tool", () => {
         throw new Error("HTTP 500: SENSITIVE-SERVER-BODY-xyz");
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.list")!;
     const result = await tool.handler(
       { collectionGlob: "vault://EXAMPLE/svc-secrets/*" },
@@ -396,12 +433,12 @@ describe("error-string scrubbing (F8)", () => {
         return [];
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert" },
@@ -428,12 +465,12 @@ describe("error-string scrubbing (F8)", () => {
         return [];
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert" },
@@ -453,12 +490,12 @@ describe("error-string scrubbing (F8)", () => {
         return [];
       },
     };
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const tool = tools.get("vault.read")!;
     const result = await tool.handler(
       { secretRef: "vault://EXAMPLE/svc-secrets/missing" },
@@ -477,7 +514,7 @@ describe("companyPolicies (fail-closed tenant scoping)", () => {
     const backend = new InMemoryVaultBackend();
     backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "pat" }, "secret-a");
     backend.set({ org: "OTHER", collection: "ci", item: "pat-b" }, "secret-b");
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://**"],
       writeAudit: async (e) => void audits.push(e),
@@ -486,7 +523,7 @@ describe("companyPolicies (fail-closed tenant scoping)", () => {
         "company-a": { allowList: ["vault://EXAMPLE/**"] },
         "company-b": { allowList: ["vault://OTHER/**"], handleMode: true },
       },
-    });
+    }));
     return { tools, audits };
   };
   const ctxFor = (companyId: string) => ({ ...runCtx, companyId });
@@ -537,12 +574,12 @@ describe("companyPolicies (fail-closed tenant scoping)", () => {
     const { ctx, tools, audits } = makeFakeCtx();
     const backend = new InMemoryVaultBackend();
     backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "pat" }, "secret-a");
-    registerVaultTools(ctx as never, {
+    registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
-    });
+    }));
     const result = await tools
       .get("vault.read")!
       .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, ctxFor("any-company"));
