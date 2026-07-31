@@ -14,12 +14,19 @@ import {
   VaultAuthError,
   VaultBackendError,
   VaultItemNotFoundError,
-  type VaultBackend,
 } from "./VaultBackend.js";
+import type { VaultRuntimeOk, VaultRuntimeResult } from "./vaultRuntime.js";
 
 export interface VaultToolDependencies {
-  backend: VaultBackend;
-  allowList: readonly string[];
+  /**
+   * Resolves the live backend + authorization config for the CURRENT call.
+   * Invoked at the top of every `vault.read` / `vault.list` dispatch — never
+   * once at registration time — so a config edit (allowList, handleMode,
+   * companyPolicies) or a plugin that finishes being configured after
+   * startup takes effect on the very next call, no worker restart. `method`
+   * identifies the calling tool for error logs.
+   */
+  resolveRuntime: (method: string) => Promise<VaultRuntimeResult>;
   /**
    * Audit log writer. Defaults to ctx.activity.log; tests inject a stub.
    * Receives outcome `success`, `denied_by_allowlist`, `not_found`,
@@ -27,26 +34,6 @@ export interface VaultToolDependencies {
    */
   writeAudit: (entry: AuditRow) => Promise<void>;
   logger: PluginLogger;
-  /**
-   * Per-binding opt-in to borrowed-handle mode (borrowed-handle mode).
-   * When true, `vault.read` returns an opaque host-minted handle (via
-   * `ctx.secrets.mintHandle`) on both `content` and `data.value` instead of
-   * plaintext. Defaults false: behaviour is unchanged until a binding opts in.
-   */
-  handleMode?: boolean;
-  /**
-   * Per-company policy keyed by Paperclip companyId. FAIL-CLOSED: when this
-   * map is present and non-empty, ONLY listed companies may call the vault
-   * tools — any other `runCtx.companyId` is denied before parsing or any
-   * network call. Each entry may narrow `allowList` (defaults to the
-   * instance allowList) and override `handleMode` (defaults to the instance
-   * flag). When absent/empty, the legacy single-allowList behaviour applies
-   * to every company.
-   */
-  companyPolicies?: Record<
-    string,
-    { allowList?: readonly string[]; handleMode?: boolean }
-  >;
 }
 
 export interface AuditRow {
@@ -83,57 +70,64 @@ export interface AuditRow {
  * directly. `handleMode` defaults off, so plaintext-reading callers keep
  * working until their binding opts in.
  */
+type CompiledPolicy = { compiled: readonly RegExp[]; handleMode: boolean };
+
+/**
+ * Compile the live runtime's allowList / companyPolicies into an effective
+ * policy for `companyId`. Runs on every call (the runtime it reads was
+ * itself just live-resolved) rather than once at registration, so a pattern
+ * edited in config takes effect on the next dispatch. Returns `null` when
+ * companyPolicies is configured and the company isn't listed (fail-closed:
+ * no fallback to the instance-wide allowList), or when a pattern fails to
+ * compile (fail-closed + loud: logged at `error`, never a silent deny).
+ */
+function policyFor(
+  runtime: Pick<VaultRuntimeOk, "allowList" | "handleMode" | "companyPolicies">,
+  companyId: string,
+  logger: PluginLogger,
+  method: string,
+): CompiledPolicy | null {
+  const compileSafely = (patterns: readonly string[]): readonly RegExp[] | null => {
+    try {
+      for (const pattern of patterns) {
+        compileAllowList([pattern]);
+      }
+      return compileAllowList(patterns);
+    } catch (err) {
+      logger.error("vault.allowlist_compile_failed", {
+        plugin: "platform.vault",
+        method,
+        error:
+          err instanceof InvalidAllowPatternError
+            ? err.message
+            : String(err instanceof Error ? err.message : err),
+      });
+      return null;
+    }
+  };
+
+  const companyPolicies = runtime.companyPolicies ?? {};
+  const policyCompanyIds = Object.keys(companyPolicies);
+
+  if (policyCompanyIds.length === 0) {
+    const compiled = compileSafely(runtime.allowList);
+    if (!compiled) return null;
+    return { compiled, handleMode: runtime.handleMode };
+  }
+
+  const policy = companyPolicies[companyId];
+  if (!policy) return null;
+  const list = policy.allowList ?? runtime.allowList;
+  const compiled = compileSafely(list);
+  if (!compiled) return null;
+  return { compiled, handleMode: policy.handleMode ?? runtime.handleMode };
+}
+
 export function registerVaultTools(
   ctx: PluginContext,
   deps: VaultToolDependencies,
 ): void {
-  const { backend, allowList, writeAudit, logger } = deps;
-  const defaultHandleMode = deps.handleMode ?? false;
-  // Validate every allowList (instance default + per-company) at
-  // registration time so a bad pattern fails loudly (before the first tool
-  // call) rather than silently denying every request.
-  const validatePatterns = (patterns: readonly string[]): void => {
-    for (const pattern of patterns) {
-      try {
-        compileAllowList([pattern]);
-      } catch (err) {
-        if (err instanceof InvalidAllowPatternError) throw err;
-        throw new Error(`failed to compile allowList pattern ${pattern}: ${String(err)}`);
-      }
-    }
-  };
-  validatePatterns(allowList);
-  const defaultCompiled = compileAllowList(allowList);
-
-  const companyPolicies = deps.companyPolicies ?? {};
-  const policyCompanyIds = Object.keys(companyPolicies);
-  const compiledByCompany = new Map<
-    string,
-    { compiled: readonly RegExp[]; handleMode: boolean }
-  >();
-  for (const companyId of policyCompanyIds) {
-    const policy = companyPolicies[companyId]!;
-    const list = policy.allowList ?? allowList;
-    validatePatterns(list);
-    compiledByCompany.set(companyId, {
-      compiled: compileAllowList(list),
-      handleMode: policy.handleMode ?? defaultHandleMode,
-    });
-  }
-
-  /**
-   * Effective policy for the calling company. `null` = denied: when
-   * companyPolicies is configured, an unlisted company gets NO vault access
-   * (fail-closed) rather than falling back to the instance-wide allowList.
-   */
-  const policyFor = (
-    companyId: string,
-  ): { compiled: readonly RegExp[]; handleMode: boolean } | null => {
-    if (policyCompanyIds.length === 0) {
-      return { compiled: defaultCompiled, handleMode: defaultHandleMode };
-    }
-    return compiledByCompany.get(companyId) ?? null;
-  };
+  const { resolveRuntime, writeAudit, logger } = deps;
 
   ctx.tools.register(
     "vault.read",
@@ -161,7 +155,18 @@ export function registerVaultTools(
         secretRef,
       };
 
-      const policy = policyFor(runCtx.companyId);
+      const runtime = await resolveRuntime("read");
+      if (!runtime.ok) {
+        await safeAudit(writeAudit, logger, {
+          ...baseAudit,
+          outcome: "error",
+          error: runtime.error,
+        });
+        return { error: runtime.error };
+      }
+      const { backend } = runtime;
+
+      const policy = policyFor(runtime, runCtx.companyId, logger, "read");
       if (!policy) {
         await safeAudit(writeAudit, logger, {
           ...baseAudit,
@@ -268,7 +273,18 @@ export function registerVaultTools(
         secretRef: glob ?? "(no glob: allowList scopes)",
       };
 
-      const policy = policyFor(runCtx.companyId);
+      const runtime = await resolveRuntime("list");
+      if (!runtime.ok) {
+        await safeAudit(writeAudit, logger, {
+          ...baseAudit,
+          outcome: "error",
+          error: runtime.error,
+        });
+        return { error: runtime.error };
+      }
+      const { backend } = runtime;
+
+      const policy = policyFor(runtime, runCtx.companyId, logger, "list");
       if (!policy) {
         await safeAudit(writeAudit, logger, {
           ...baseAudit,
