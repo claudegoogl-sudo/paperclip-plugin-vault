@@ -184,6 +184,16 @@ interface UnlockedSession {
 
 export class VaultwardenBackend implements VaultBackend {
   private session: UnlockedSession | null = null;
+  /**
+   * Single-flight guard for {@link unlock}. Without this, a burst of
+   * concurrent dispatches that all observe a cold/expired session (e.g.
+   * right after activation, or right after a TTL reprime clears the session)
+   * would each independently run prelogin + password resolve + PBKDF2 +
+   * token exchange + `/api/sync` against the shared Vaultwarden service
+   * account — a thundering herd that risks tripping Vaultwarden's own
+   * login rate limiting and locking the plugin out for every tenant.
+   */
+  private unlockInFlight: Promise<UnlockedSession> | null = null;
   private readonly fetchImpl: typeof fetch;
   private readonly deviceIdentifier: string;
   /**
@@ -287,6 +297,26 @@ export class VaultwardenBackend implements VaultBackend {
     if (this.session && this.session.tokenExpiresAt > Date.now() + 30_000) {
       return this.session;
     }
+    // Concurrent callers (e.g. a dispatch burst right after a cold start or
+    // a TTL reprime) share one in-progress unlock instead of each starting
+    // their own. Every caller converges on the same `this.session` regardless
+    // of which runId's password-resolve happens to win the race: the
+    // resolved master password is the same secret value for every runId
+    // (see {@link VaultwardenBackendOptions.resolvePassword}) — only the
+    // authorization check behind `ctx.secrets.resolve` differs.
+    if (this.unlockInFlight) {
+      return this.unlockInFlight;
+    }
+    const inFlight = this.doUnlock(runId).finally(() => {
+      if (this.unlockInFlight === inFlight) {
+        this.unlockInFlight = null;
+      }
+    });
+    this.unlockInFlight = inFlight;
+    return inFlight;
+  }
+
+  private async doUnlock(runId?: string): Promise<UnlockedSession> {
     const email = this.opts.email.trim().toLowerCase();
     const prelogin = await this.postJson<PreloginResponse>(
       "/api/accounts/prelogin",

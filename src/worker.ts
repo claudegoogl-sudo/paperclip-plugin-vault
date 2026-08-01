@@ -96,6 +96,19 @@ export function createVaultRuntimeResolver(
     identity: BackendIdentity;
     backend: VaultwardenBackend;
     lastPrimedAt: number;
+    /**
+     * Tracks a currently-running {@link VaultwardenBackend.prime} for this
+     * cached backend (started either by the cold-build path below or by the
+     * TTL-reprime branch here). While set, a dispatch that observes an
+     * expired `lastPrimedAt` piggybacks on it instead of calling `clear()` +
+     * starting a second `prime()` — `VaultwardenBackend.unlock()` is itself
+     * single-flighted, so a second `prime()` would converge on the same
+     * network round-trip anyway, but skipping the redundant `clear()` avoids
+     * wiping a session another concurrent dispatch is about to receive.
+     * Never rejects: prime failures are caught and logged where the promise
+     * is created.
+     */
+    primeInFlight: Promise<void> | null;
   } | null = null;
 
   return async (method: string): Promise<VaultRuntimeResult> => {
@@ -157,16 +170,34 @@ export function createVaultRuntimeResolver(
       // runs live on every dispatch instead of a background timer, so it
       // never keys off a stale setup-time TTL value.
       if (Date.now() - cached.lastPrimedAt >= ttlMs) {
-        cached.backend.clear();
-        try {
-          await cached.backend.prime();
-          cached.lastPrimedAt = Date.now();
-        } catch (err) {
-          ctx.logger.warn("vault.session_reprime_failed", {
-            plugin: "platform.vault",
-            method,
-            error: String(err instanceof Error ? err.message : err),
+        if (cached.primeInFlight) {
+          // Another concurrent dispatch already started a reprime (or this
+          // is still the cold-build prime from below); await it instead of
+          // clearing the session out from under it and starting a duplicate.
+          await cached.primeInFlight;
+        } else {
+          cached.backend.clear();
+          const primeStarted = cached;
+          const primePromise = cached.backend.prime().then(
+            () => {
+              if (cached === primeStarted) {
+                cached.lastPrimedAt = Date.now();
+              }
+            },
+            (err) => {
+              ctx.logger.warn("vault.session_reprime_failed", {
+                plugin: "platform.vault",
+                method,
+                error: String(err instanceof Error ? err.message : err),
+              });
+            },
+          );
+          cached.primeInFlight = primePromise.finally(() => {
+            if (cached === primeStarted) {
+              cached.primeInFlight = null;
+            }
           });
+          await cached.primeInFlight;
         }
       }
       return {
@@ -232,11 +263,11 @@ export function createVaultRuntimeResolver(
     // the *first* tool call for a company that isn't the master-password
     // owner failing with a retryable error until the background prime (or
     // that company's own dispatch-triggered unlock) lands.
-    cached = { identity, backend, lastPrimedAt: 0 };
-    const primingBackend = backend;
-    void backend.prime().then(
+    cached = { identity, backend, lastPrimedAt: 0, primeInFlight: null };
+    const primeStarted = cached;
+    const primePromise = backend.prime().then(
       () => {
-        if (cached && cached.backend === primingBackend) {
+        if (cached === primeStarted) {
           cached.lastPrimedAt = Date.now();
         }
         ctx.logger.info("vault session primed", { method });
@@ -249,6 +280,11 @@ export function createVaultRuntimeResolver(
         });
       },
     );
+    cached.primeInFlight = primePromise.finally(() => {
+      if (cached === primeStarted) {
+        cached.primeInFlight = null;
+      }
+    });
     ctx.logger.info("vault backend (re)built for the current config", {
       method,
       serverUrl: identity.serverUrl,
