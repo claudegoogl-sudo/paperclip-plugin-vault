@@ -4,11 +4,12 @@ import {
   createHmac,
   createPrivateKey,
   type KeyObject,
-  pbkdf2Sync,
+  pbkdf2 as pbkdf2Callback,
   privateDecrypt,
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { promisify } from "node:util";
 import type {
   PluginHttpClient,
   PluginLogger,
@@ -61,6 +62,14 @@ import { validateVaultServerUrl } from "./validateVaultServerUrl.js";
  * Bitwarden default (and OWASP guidance) for SHA-256. See F5.
  */
 const MIN_PBKDF2_ITERATIONS = 600_000;
+
+/**
+ * `pbkdf2Sync` blocks the whole JS thread for the duration of the derivation
+ * (multi-second at 600k+ iterations); the async form runs on the libuv
+ * threadpool instead, so `unlock()` no longer stalls other RPC traffic on
+ * this worker (or the `initialize` reply) while deriving keys.
+ */
+const pbkdf2 = promisify(pbkdf2Callback);
 
 /**
  * Modern Vaultwarden/Bitwarden `/api/*` responses use camelCase keys, while
@@ -305,19 +314,15 @@ export class VaultwardenBackend implements VaultBackend {
     let masterKey: Buffer;
     let hashedPassword: string;
     try {
-      masterKey = pbkdf2Sync(
+      masterKey = await pbkdf2(
         Buffer.from(password, "utf8"),
         Buffer.from(email, "utf8"),
         prelogin.kdfIterations,
         32,
         "sha256",
       );
-      hashedPassword = pbkdf2Sync(
-        masterKey,
-        Buffer.from(password, "utf8"),
-        1,
-        32,
-        "sha256",
+      hashedPassword = (
+        await pbkdf2(masterKey, Buffer.from(password, "utf8"), 1, 32, "sha256")
       ).toString("base64");
     } finally {
       // Drop the plaintext password reference as fast as we can.

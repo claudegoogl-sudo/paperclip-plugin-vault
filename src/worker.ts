@@ -222,16 +222,33 @@ export function createVaultRuntimeResolver(
       };
     }
 
-    try {
-      await backend.prime();
-    } catch (err) {
-      ctx.logger.warn("vault.session_prime_failed", {
-        plugin: "platform.vault",
-        method,
-        error: String(err instanceof Error ? err.message : err),
-      });
-    }
-    cached = { identity, backend, lastPrimedAt: Date.now() };
+    // Priming is best-effort and must never sit on this resolver's return
+    // path: the caller may be the eager "setup" resolve, which the host's
+    // worker-activation RPC (`initialize`) is waiting on with a fixed,
+    // non-tunable budget. Session priming does a network round-trip plus a
+    // 600k+-iteration PBKDF2 derivation, which can easily run long under
+    // host load — so it runs fire-and-forget here. A cold/still-priming
+    // session doesn't block activation or tool registration; it only risks
+    // the *first* tool call for a company that isn't the master-password
+    // owner failing with a retryable error until the background prime (or
+    // that company's own dispatch-triggered unlock) lands.
+    cached = { identity, backend, lastPrimedAt: 0 };
+    const primingBackend = backend;
+    void backend.prime().then(
+      () => {
+        if (cached && cached.backend === primingBackend) {
+          cached.lastPrimedAt = Date.now();
+        }
+        ctx.logger.info("vault session primed", { method });
+      },
+      (err) => {
+        ctx.logger.warn("vault.session_prime_failed", {
+          plugin: "platform.vault",
+          method,
+          error: String(err instanceof Error ? err.message : err),
+        });
+      },
+    );
     ctx.logger.info("vault backend (re)built for the current config", {
       method,
       serverUrl: identity.serverUrl,
