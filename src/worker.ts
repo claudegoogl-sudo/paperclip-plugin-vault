@@ -4,6 +4,7 @@ import { registerVaultTools } from "./worker/registerTools.js";
 import type { VaultBackend } from "./worker/VaultBackend.js";
 import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
 import type { VaultRuntimeResult } from "./worker/vaultRuntime.js";
+import { raiseDeniedAlarmIfNew } from "./worker/deniedAlarm.js";
 
 interface VaultConfig {
   serverUrl?: string;
@@ -346,6 +347,47 @@ function makeActivityAudit(
         ...(entry.error ? { error: entry.error } : {}),
       },
     });
+    // Denied-by-allowList rows additionally raise an idempotent Paperclip
+    // issue so the platform team sees them within hours, not on a fortnightly
+    // audit-review cadence. The row already carries every field the alarm
+    // needs (agentId, runId, companyId, secretRef) — we do NOT widen what the
+    // plugin logs to drive this; the alarm consumes the existing row. The
+    // alarm fires after the audit row is durably written so a state or issue
+    // failure never loses the audit record. Best-effort: errors are caught
+    // inside `raiseDeniedAlarmIfNew` and never reach the caller.
+    if (entry.outcome === "denied_by_allowlist") {
+      await raiseDeniedAlarmIfNew(
+        {
+          getState: (key) =>
+            ctx.state.get({
+              scopeKind: "company",
+              scopeId: entry.companyId,
+              namespace: "denied-alarms",
+              stateKey: key,
+            }),
+          setState: (key, value) =>
+            ctx.state.set(
+              {
+                scopeKind: "company",
+                scopeId: entry.companyId,
+                namespace: "denied-alarms",
+                stateKey: key,
+              },
+              value,
+            ),
+          createIssue: (input) =>
+            ctx.issues.create({
+              companyId: entry.companyId,
+              title: input.title,
+              description: input.description,
+              priority: input.priority,
+            }),
+          log: (level, message, meta) => ctx.logger[level](message, meta),
+          companyId: entry.companyId,
+        },
+        entry,
+      );
+    }
   };
 }
 
