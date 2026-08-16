@@ -4,6 +4,7 @@ import { registerVaultTools } from "./worker/registerTools.js";
 import type { VaultBackend } from "./worker/VaultBackend.js";
 import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
 import type { VaultRuntimeResult } from "./worker/vaultRuntime.js";
+import { raiseDeniedAlarmIfNew } from "./worker/deniedAlarm.js";
 
 interface VaultConfig {
   serverUrl?: string;
@@ -96,6 +97,19 @@ export function createVaultRuntimeResolver(
     identity: BackendIdentity;
     backend: VaultwardenBackend;
     lastPrimedAt: number;
+    /**
+     * Tracks a currently-running {@link VaultwardenBackend.prime} for this
+     * cached backend (started either by the cold-build path below or by the
+     * TTL-reprime branch here). While set, a dispatch that observes an
+     * expired `lastPrimedAt` piggybacks on it instead of calling `clear()` +
+     * starting a second `prime()` — `VaultwardenBackend.unlock()` is itself
+     * single-flighted, so a second `prime()` would converge on the same
+     * network round-trip anyway, but skipping the redundant `clear()` avoids
+     * wiping a session another concurrent dispatch is about to receive.
+     * Never rejects: prime failures are caught and logged where the promise
+     * is created.
+     */
+    primeInFlight: Promise<void> | null;
   } | null = null;
 
   return async (method: string): Promise<VaultRuntimeResult> => {
@@ -157,16 +171,34 @@ export function createVaultRuntimeResolver(
       // runs live on every dispatch instead of a background timer, so it
       // never keys off a stale setup-time TTL value.
       if (Date.now() - cached.lastPrimedAt >= ttlMs) {
-        cached.backend.clear();
-        try {
-          await cached.backend.prime();
-          cached.lastPrimedAt = Date.now();
-        } catch (err) {
-          ctx.logger.warn("vault.session_reprime_failed", {
-            plugin: "platform.vault",
-            method,
-            error: String(err instanceof Error ? err.message : err),
+        if (cached.primeInFlight) {
+          // Another concurrent dispatch already started a reprime (or this
+          // is still the cold-build prime from below); await it instead of
+          // clearing the session out from under it and starting a duplicate.
+          await cached.primeInFlight;
+        } else {
+          cached.backend.clear();
+          const primeStarted = cached;
+          const primePromise = cached.backend.prime().then(
+            () => {
+              if (cached === primeStarted) {
+                cached.lastPrimedAt = Date.now();
+              }
+            },
+            (err) => {
+              ctx.logger.warn("vault.session_reprime_failed", {
+                plugin: "platform.vault",
+                method,
+                error: String(err instanceof Error ? err.message : err),
+              });
+            },
+          );
+          cached.primeInFlight = primePromise.finally(() => {
+            if (cached === primeStarted) {
+              cached.primeInFlight = null;
+            }
           });
+          await cached.primeInFlight;
         }
       }
       return {
@@ -222,16 +254,38 @@ export function createVaultRuntimeResolver(
       };
     }
 
-    try {
-      await backend.prime();
-    } catch (err) {
-      ctx.logger.warn("vault.session_prime_failed", {
-        plugin: "platform.vault",
-        method,
-        error: String(err instanceof Error ? err.message : err),
-      });
-    }
-    cached = { identity, backend, lastPrimedAt: Date.now() };
+    // Priming is best-effort and must never sit on this resolver's return
+    // path: the caller may be the eager "setup" resolve, which the host's
+    // worker-activation RPC (`initialize`) is waiting on with a fixed,
+    // non-tunable budget. Session priming does a network round-trip plus a
+    // 600k+-iteration PBKDF2 derivation, which can easily run long under
+    // host load — so it runs fire-and-forget here. A cold/still-priming
+    // session doesn't block activation or tool registration; it only risks
+    // the *first* tool call for a company that isn't the master-password
+    // owner failing with a retryable error until the background prime (or
+    // that company's own dispatch-triggered unlock) lands.
+    cached = { identity, backend, lastPrimedAt: 0, primeInFlight: null };
+    const primeStarted = cached;
+    const primePromise = backend.prime().then(
+      () => {
+        if (cached === primeStarted) {
+          cached.lastPrimedAt = Date.now();
+        }
+        ctx.logger.info("vault session primed", { method });
+      },
+      (err) => {
+        ctx.logger.warn("vault.session_prime_failed", {
+          plugin: "platform.vault",
+          method,
+          error: String(err instanceof Error ? err.message : err),
+        });
+      },
+    );
+    cached.primeInFlight = primePromise.finally(() => {
+      if (cached === primeStarted) {
+        cached.primeInFlight = null;
+      }
+    });
     ctx.logger.info("vault backend (re)built for the current config", {
       method,
       serverUrl: identity.serverUrl,
@@ -293,6 +347,47 @@ function makeActivityAudit(
         ...(entry.error ? { error: entry.error } : {}),
       },
     });
+    // Denied-by-allowList rows additionally raise an idempotent Paperclip
+    // issue so the platform team sees them within hours, not on a fortnightly
+    // audit-review cadence. The row already carries every field the alarm
+    // needs (agentId, runId, companyId, secretRef) — we do NOT widen what the
+    // plugin logs to drive this; the alarm consumes the existing row. The
+    // alarm fires after the audit row is durably written so a state or issue
+    // failure never loses the audit record. Best-effort: errors are caught
+    // inside `raiseDeniedAlarmIfNew` and never reach the caller.
+    if (entry.outcome === "denied_by_allowlist") {
+      await raiseDeniedAlarmIfNew(
+        {
+          getState: (key) =>
+            ctx.state.get({
+              scopeKind: "company",
+              scopeId: entry.companyId,
+              namespace: "denied-alarms",
+              stateKey: key,
+            }),
+          setState: (key, value) =>
+            ctx.state.set(
+              {
+                scopeKind: "company",
+                scopeId: entry.companyId,
+                namespace: "denied-alarms",
+                stateKey: key,
+              },
+              value,
+            ),
+          createIssue: (input) =>
+            ctx.issues.create({
+              companyId: entry.companyId,
+              title: input.title,
+              description: input.description,
+              priority: input.priority,
+            }),
+          log: (level, message, meta) => ctx.logger[level](message, meta),
+          companyId: entry.companyId,
+        },
+        entry,
+      );
+    }
   };
 }
 

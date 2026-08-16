@@ -4,11 +4,12 @@ import {
   createHmac,
   createPrivateKey,
   type KeyObject,
-  pbkdf2Sync,
+  pbkdf2 as pbkdf2Callback,
   privateDecrypt,
   randomUUID,
   timingSafeEqual,
 } from "node:crypto";
+import { promisify } from "node:util";
 import type {
   PluginHttpClient,
   PluginLogger,
@@ -64,6 +65,14 @@ import { validateVaultServerUrl } from "./validateVaultServerUrl.js";
  * Bitwarden default (and OWASP guidance) for SHA-256. See F5.
  */
 const MIN_PBKDF2_ITERATIONS = 600_000;
+
+/**
+ * `pbkdf2Sync` blocks the whole JS thread for the duration of the derivation
+ * (multi-second at 600k+ iterations); the async form runs on the libuv
+ * threadpool instead, so `unlock()` no longer stalls other RPC traffic on
+ * this worker (or the `initialize` reply) while deriving keys.
+ */
+const pbkdf2 = promisify(pbkdf2Callback);
 
 /**
  * Modern Vaultwarden/Bitwarden `/api/*` responses use camelCase keys, while
@@ -195,6 +204,16 @@ type FetchLike = (
 
 export class VaultwardenBackend implements VaultBackend {
   private session: UnlockedSession | null = null;
+  /**
+   * Single-flight guard for {@link unlock}. Without this, a burst of
+   * concurrent dispatches that all observe a cold/expired session (e.g.
+   * right after activation, or right after a TTL reprime clears the session)
+   * would each independently run prelogin + password resolve + PBKDF2 +
+   * token exchange + `/api/sync` against the shared Vaultwarden service
+   * account — a thundering herd that risks tripping Vaultwarden's own
+   * login rate limiting and locking the plugin out for every tenant.
+   */
+  private unlockInFlight: Promise<UnlockedSession> | null = null;
   private readonly fetchImpl: FetchLike;
   private readonly deviceIdentifier: string;
   /**
@@ -301,6 +320,26 @@ export class VaultwardenBackend implements VaultBackend {
     if (this.session && this.session.tokenExpiresAt > Date.now() + 30_000) {
       return this.session;
     }
+    // Concurrent callers (e.g. a dispatch burst right after a cold start or
+    // a TTL reprime) share one in-progress unlock instead of each starting
+    // their own. Every caller converges on the same `this.session` regardless
+    // of which runId's password-resolve happens to win the race: the
+    // resolved master password is the same secret value for every runId
+    // (see {@link VaultwardenBackendOptions.resolvePassword}) — only the
+    // authorization check behind `ctx.secrets.resolve` differs.
+    if (this.unlockInFlight) {
+      return this.unlockInFlight;
+    }
+    const inFlight = this.doUnlock(runId).finally(() => {
+      if (this.unlockInFlight === inFlight) {
+        this.unlockInFlight = null;
+      }
+    });
+    this.unlockInFlight = inFlight;
+    return inFlight;
+  }
+
+  private async doUnlock(runId?: string): Promise<UnlockedSession> {
     const email = this.opts.email.trim().toLowerCase();
     const prelogin = await this.postJson<PreloginResponse>(
       "/api/accounts/prelogin",
@@ -328,19 +367,15 @@ export class VaultwardenBackend implements VaultBackend {
     let masterKey: Buffer;
     let hashedPassword: string;
     try {
-      masterKey = pbkdf2Sync(
+      masterKey = await pbkdf2(
         Buffer.from(password, "utf8"),
         Buffer.from(email, "utf8"),
         prelogin.kdfIterations,
         32,
         "sha256",
       );
-      hashedPassword = pbkdf2Sync(
-        masterKey,
-        Buffer.from(password, "utf8"),
-        1,
-        32,
-        "sha256",
+      hashedPassword = (
+        await pbkdf2(masterKey, Buffer.from(password, "utf8"), 1, 32, "sha256")
       ).toString("base64");
     } finally {
       // Drop the plaintext password reference as fast as we can.

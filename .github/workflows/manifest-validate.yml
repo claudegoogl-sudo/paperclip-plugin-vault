@@ -42,7 +42,7 @@ on:
 
 jobs:
   validate-manifest:
-    name: validate dist/manifest.js against pluginManifestV1Schema
+    name: typecheck + unit tests + manifest validation
     runs-on: ubuntu-latest
     permissions:
       contents: read

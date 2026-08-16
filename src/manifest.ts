@@ -34,6 +34,14 @@ const manifest: PaperclipPluginManifestV1 = {
     "agent.tools.register",
     // Per-call audit row: (agentId, runId, secretRef, outcome).
     "activity.log.write",
+    // Denied-by-allowList alarm: idempotent state key per (agentId, ref) so
+    // repeated denials collapse into one alarm issue. See worker/deniedAlarm.ts.
+    "plugin.state.read",
+    "plugin.state.write",
+    // File the alarm Paperclip issue in the dispatching company's tenant on
+    // the first denial of a (agentId, ref) tuple. The plugin never reads or
+    // updates issues — create-only.
+    "issues.create",
   ],
 
   entrypoints: {
