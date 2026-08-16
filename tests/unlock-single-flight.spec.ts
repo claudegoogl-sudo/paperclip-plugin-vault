@@ -100,31 +100,32 @@ describe("concurrent dispatches share one unlock instead of a thundering herd", 
     const token = buildTokenPayload();
     const callCounts = { prelogin: 0, token: 0, sync: 0 };
 
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (url: string | URL) => {
-        const u = String(url);
-        if (u.endsWith("/api/accounts/prelogin")) {
-          callCounts.prelogin++;
-          return res({ kdf: 0, kdfIterations: ITERATIONS });
-        }
-        if (u.endsWith("/identity/connect/token")) {
-          callCounts.token++;
-          return res(token);
-        }
-        if (u.endsWith("/api/sync")) {
-          callCounts.sync++;
-          return res({ Profile: { Organizations: [] }, Collections: [], Ciphers: [] });
-        }
-        return new Response("unexpected path", { status: 404 });
-      }),
-    );
+    // Production traffic runs through ctx.http.fetch (the host-mediated
+    // client), never globalThis.fetch — so the single-flight mock has to
+    // sit on http.fetch, otherwise it would never be hit.
+    const httpFetch = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.endsWith("/api/accounts/prelogin")) {
+        callCounts.prelogin++;
+        return res({ kdf: 0, kdfIterations: ITERATIONS });
+      }
+      if (u.endsWith("/identity/connect/token")) {
+        callCounts.token++;
+        return res(token);
+      }
+      if (u.endsWith("/api/sync")) {
+        callCounts.sync++;
+        return res({ Profile: { Organizations: [] }, Collections: [], Ciphers: [] });
+      }
+      return new Response("unexpected path", { status: 404 });
+    });
 
     const ctx = fakeCtx({
       serviceAccountEmail: EMAIL,
       masterPasswordRef: "vault-master-password-secret",
       allowList: ["vault://**"],
     });
+    (ctx as { http: unknown }).http = { fetch: httpFetch };
 
     const resolveRuntime = createVaultRuntimeResolver(ctx as never);
 
