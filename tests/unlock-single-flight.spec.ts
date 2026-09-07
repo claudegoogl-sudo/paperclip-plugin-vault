@@ -85,7 +85,7 @@ function fakeCtx(config: Record<string, unknown>) {
   return {
     config: { get: async () => config },
     logger: fakeLogger(),
-    secrets: { resolve: async () => PASSWORD },
+    secrets: { resolve: async () => PASSWORD, resolveService: async () => PASSWORD },
     http: {} as never,
     activity: { log: async () => {} },
   };
