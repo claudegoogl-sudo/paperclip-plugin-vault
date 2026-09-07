@@ -70,23 +70,80 @@ export interface AuditRow {
  * directly. `handleMode` defaults off, so plaintext-reading callers keep
  * working until their binding opts in.
  */
-type CompiledPolicy = { compiled: readonly RegExp[]; handleMode: boolean };
+export type PolicyDenyReason =
+  | "policymap_missing"
+  | "company_unlisted"
+  | "entry_missing_allowlist"
+  | "allowlist_compile_failed";
+
+export type PolicyDecision =
+  | { ok: true; compiled: readonly RegExp[]; handleMode: boolean }
+  | { ok: false; reason: PolicyDenyReason };
 
 /**
- * Compile the live runtime's allowList / companyPolicies into an effective
- * policy for `companyId`. Runs on every call (the runtime it reads was
- * itself just live-resolved) rather than once at registration, so a pattern
- * edited in config takes effect on the next dispatch. Returns `null` when
- * companyPolicies is configured and the company isn't listed (fail-closed:
- * no fallback to the instance-wide allowList), or when a pattern fails to
- * compile (fail-closed + loud: logged at `error`, never a silent deny).
+ * Caller-facing tool error string for each deny reason. Kept next to
+ * `policyFor` so the reason union and the wording can never drift apart;
+ * both tool call sites map a deny decision through this and audit
+ * `denied_by_allowlist` identically.
  */
-function policyFor(
-  runtime: Pick<VaultRuntimeOk, "allowList" | "handleMode" | "companyPolicies">,
+export function policyDenyMessage(reason: PolicyDenyReason): string {
+  switch (reason) {
+    case "policymap_missing":
+      return (
+        `prerequisite_missing: companyPolicies is empty or absent — the ` +
+        `instance-level allowList grants nothing. Add one companyPolicies ` +
+        `entry (keyed by companyId) for every company that needs vault access.`
+      );
+    case "entry_missing_allowlist":
+      return (
+        `prerequisite_missing: this company's companyPolicies entry has no ` +
+        `allowList — entries never inherit the instance-level allowList. ` +
+        `Add allowList to the entry (or remove the entry to deny this company).`
+      );
+    case "allowlist_compile_failed":
+      return (
+        `prerequisite_missing: this company's allowList contains a pattern ` +
+        `that failed to compile — see worker log vault.allowlist_compile_failed.`
+      );
+    case "company_unlisted":
+      return (
+        `prerequisite_missing: no vault policy is configured for this ` +
+        `company. Ask the Platform CTO to add a companyPolicies entry.`
+      );
+  }
+}
+
+/**
+ * Derive the effective policy for `companyId` from the companyPolicies map
+ * ALONE — entries are the only grant source. This function deliberately
+ * takes `Pick<VaultRuntimeOk, "companyPolicies">`, not the full runtime:
+ * the instance-level `allowList`/`handleMode` are parameterized out, so an
+ * inheritance fallback is unwritable rather than merely discouraged. Runs
+ * on every call (the runtime was just live-resolved) so a config edit takes
+ * effect on the next dispatch.
+ *
+ * Fail-closed contract (every row exercised in tests):
+ * - map absent or empty                → deny `policymap_missing` (logged at `error`)
+ * - company not listed                 → deny `company_unlisted` (designed deny — no error event)
+ * - listed, entry lacks `allowList`    → deny `entry_missing_allowlist` (logged at `error`)
+ * - listed, entry `allowList` present  → grant = the entry's patterns ONLY.
+ *   The entry REPLACES the instance list (never intersects or narrows it).
+ *   An empty entry list therefore denies by matching nothing. A pattern
+ *   that fails to compile → deny `allowlist_compile_failed` (existing
+ *   `vault.allowlist_compile_failed` error event).
+ * - `handleMode` comes only from the entry; omitted = OFF.
+ *
+ * Defensive shape handling (runtime data is host-supplied, but fail closed
+ * on drift): a map that is not an object is absent; an entry that is not an
+ * object is unlisted; an entry `allowList` that is not an array is
+ * `entry_missing_allowlist`; an empty-string companyId is never grantable.
+ */
+export function policyFor(
+  runtime: Pick<VaultRuntimeOk, "companyPolicies">,
   companyId: string,
   logger: PluginLogger,
   method: string,
-): CompiledPolicy | null {
+): PolicyDecision {
   const compileSafely = (patterns: readonly string[]): readonly RegExp[] | null => {
     try {
       for (const pattern of patterns) {
@@ -106,21 +163,40 @@ function policyFor(
     }
   };
 
-  const companyPolicies = runtime.companyPolicies ?? {};
-  const policyCompanyIds = Object.keys(companyPolicies);
-
-  if (policyCompanyIds.length === 0) {
-    const compiled = compileSafely(runtime.allowList);
-    if (!compiled) return null;
-    return { compiled, handleMode: runtime.handleMode };
+  const companyPolicies = runtime.companyPolicies;
+  const entries =
+    companyPolicies && typeof companyPolicies === "object"
+      ? Object.entries(companyPolicies)
+      : [];
+  if (entries.length === 0) {
+    logger.error("vault.policymap_missing", {
+      plugin: "platform.vault",
+      method,
+    });
+    return { ok: false, reason: "policymap_missing" };
   }
 
-  const policy = companyPolicies[companyId];
-  if (!policy) return null;
-  const list = policy.allowList ?? runtime.allowList;
-  const compiled = compileSafely(list);
-  if (!compiled) return null;
-  return { compiled, handleMode: policy.handleMode ?? runtime.handleMode };
+  if (companyId.length === 0) {
+    return { ok: false, reason: "company_unlisted" };
+  }
+  const entry: unknown = (companyPolicies as Record<string, unknown>)[companyId];
+  if (typeof entry !== "object" || entry === null) {
+    return { ok: false, reason: "company_unlisted" };
+  }
+
+  const allowList = (entry as { allowList?: unknown }).allowList;
+  if (!Array.isArray(allowList)) {
+    logger.error("vault.policy_entry_missing_allowlist", {
+      plugin: "platform.vault",
+      method,
+      companyId,
+    });
+    return { ok: false, reason: "entry_missing_allowlist" };
+  }
+
+  const compiled = compileSafely(allowList);
+  if (!compiled) return { ok: false, reason: "allowlist_compile_failed" };
+  return { ok: true, compiled, handleMode: (entry as { handleMode?: unknown }).handleMode === true };
 }
 
 export function registerVaultTools(
@@ -167,16 +243,12 @@ export function registerVaultTools(
       const { backend } = runtime;
 
       const policy = policyFor(runtime, runCtx.companyId, logger, "read");
-      if (!policy) {
+      if (!policy.ok) {
         await safeAudit(writeAudit, logger, {
           ...baseAudit,
           outcome: "denied_by_allowlist",
         });
-        return {
-          error:
-            `prerequisite_missing: no vault policy is configured for this ` +
-            `company. Ask the Platform CTO to add a companyPolicies entry.`,
-        };
+        return { error: policyDenyMessage(policy.reason) };
       }
 
       let parsed;
@@ -285,16 +357,12 @@ export function registerVaultTools(
       const { backend } = runtime;
 
       const policy = policyFor(runtime, runCtx.companyId, logger, "list");
-      if (!policy) {
+      if (!policy.ok) {
         await safeAudit(writeAudit, logger, {
           ...baseAudit,
           outcome: "denied_by_allowlist",
         });
-        return {
-          error:
-            `prerequisite_missing: no vault policy is configured for this ` +
-            `company. Ask the Platform CTO to add a companyPolicies entry.`,
-        };
+        return { error: policyDenyMessage(policy.reason) };
       }
 
       let filter: { org?: string; collection?: string } | undefined;

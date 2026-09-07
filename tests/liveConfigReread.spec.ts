@@ -13,6 +13,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createTestHarness } from "@paperclipai/plugin-sdk/testing";
 import { createVaultWorker } from "../src/worker.js";
+import { policyDenyMessage } from "../src/worker/registerTools.js";
 import { InMemoryVaultBackend } from "../src/worker/VaultBackend.js";
 import manifest from "../src/manifest.js";
 
@@ -48,12 +49,19 @@ function setupHarness(initialConfig: Record<string, unknown>) {
 }
 
 describe("vault config gates are re-read live on every dispatch (no setup-time caching)", () => {
-  it("picks up an allowList widened AFTER setup, on the very next call, with no worker restart", async () => {
-    const { harness, backend, readTool } = setupHarness({
+  it("picks up a companyPolicies ENTRY widened AFTER setup, on the very next call, with no worker restart", async () => {
+    // Live-reread must hold for the only grant source there is: the map
+    // entry. Widening the entry (map present throughout) is honored on the
+    // next dispatch.
+    const configWith = (entryAllowList: string[]) => ({
       serviceAccountEmail: "svc@example.com",
       masterPasswordRef: "vault-master-password-secret",
-      allowList: ["vault://EXAMPLE/svc-secrets/other-item"],
+      allowList: ["vault://**"],
+      companyPolicies: { "company-a": { allowList: entryAllowList } },
     });
+    const { harness, backend, readTool } = setupHarness(
+      configWith(["vault://EXAMPLE/svc-secrets/other-item"]),
+    );
     await createVaultWorker(harness.ctx, {
       backendOverride: backend,
     });
@@ -61,18 +69,14 @@ describe("vault config gates are re-read live on every dispatch (no setup-time c
     const before = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
     expect(before.error).toMatch(/^prerequisite_missing/);
 
-    // Operator widens the allowList — no re-registration / worker restart.
-    harness.setConfig({
-      serviceAccountEmail: "svc@example.com",
-      masterPasswordRef: "vault-master-password-secret",
-      allowList: ["vault://EXAMPLE/svc-secrets/*"],
-    });
+    // Operator widens the ENTRY — no re-registration / worker restart.
+    harness.setConfig(configWith(["vault://EXAMPLE/svc-secrets/*"]));
 
     const after = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
     expect(after.error).toBeUndefined();
   });
 
-  it("self-heals a worker that booted with an empty allowList once config arrives, with no restart", async () => {
+  it("self-heals a worker that booted unconfigured once a FULL config (including the companyPolicies map) arrives, with no restart", async () => {
     const { harness, backend, readTool } = setupHarness({});
     await createVaultWorker(harness.ctx, {
       backendOverride: backend,
@@ -85,10 +89,94 @@ describe("vault config gates are re-read live on every dispatch (no setup-time c
       serviceAccountEmail: "svc@example.com",
       masterPasswordRef: "vault-master-password-secret",
       allowList: ["vault://EXAMPLE/svc-secrets/*"],
+      companyPolicies: {
+        "company-a": { allowList: ["vault://EXAMPLE/svc-secrets/*"] },
+      },
     });
 
     const after = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
     expect(after.error).toBeUndefined();
+  });
+
+  it("denies the very next call when an operator DELETES companyPolicies live — even with the instance allowList intact (drift shape A)", async () => {
+    const configured = {
+      serviceAccountEmail: "svc@example.com",
+      masterPasswordRef: "vault-master-password-secret",
+      allowList: ["vault://EXAMPLE/svc-secrets/*"],
+      companyPolicies: {
+        "company-a": { allowList: ["vault://EXAMPLE/svc-secrets/*"] },
+      },
+    };
+    const { harness, backend, readTool } = setupHarness(configured);
+    await createVaultWorker(harness.ctx, {
+      backendOverride: backend,
+    });
+
+    const granted = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
+    expect(granted.error).toBeUndefined();
+
+    // The drift: the map is deleted; the instance-level allowList survives
+    // untouched. Pre-0.2.0 the next call SUCCEEDED via the top-level
+    // fallback; now it must deny loudly on the very next dispatch.
+    harness.setConfig({
+      serviceAccountEmail: "svc@example.com",
+      masterPasswordRef: "vault-master-password-secret",
+      allowList: ["vault://EXAMPLE/svc-secrets/*"],
+    });
+
+    const after = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
+    expect(after.error).toBe(policyDenyMessage("policymap_missing"));
+    // Loud per call + the ordinary audit/alarm channel still fires.
+    expect(
+      harness.logs.some(
+        (e) => e.level === "error" && e.message === "vault.policymap_missing",
+      ),
+    ).toBe(true);
+    expect(
+      harness.activity.some(
+        (a) =>
+          a.entityType === "vault.read" &&
+          a.metadata?.outcome === "denied_by_allowlist",
+      ),
+    ).toBe(true);
+  });
+
+  it("denies the very next call when a live edit strips allowList from an entry (drift shape B)", async () => {
+    const configured = {
+      serviceAccountEmail: "svc@example.com",
+      masterPasswordRef: "vault-master-password-secret",
+      allowList: ["vault://EXAMPLE/svc-secrets/*"],
+      companyPolicies: {
+        "company-a": { allowList: ["vault://EXAMPLE/svc-secrets/*"] },
+      },
+    };
+    const { harness, backend, readTool } = setupHarness(configured);
+    await createVaultWorker(harness.ctx, {
+      backendOverride: backend,
+    });
+
+    const granted = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
+    expect(granted.error).toBeUndefined();
+
+    // The drift: the entry survives but loses its allowList (and even asks
+    // for handleMode). Entries never inherit — the next call denies.
+    harness.setConfig({
+      serviceAccountEmail: "svc@example.com",
+      masterPasswordRef: "vault-master-password-secret",
+      allowList: ["vault://EXAMPLE/svc-secrets/*"],
+      companyPolicies: { "company-a": { handleMode: true } },
+    });
+
+    const after = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
+    expect(after.error).toBe(policyDenyMessage("entry_missing_allowlist"));
+    expect(
+      harness.logs.some(
+        (e) =>
+          e.level === "error" &&
+          e.message === "vault.policy_entry_missing_allowlist" &&
+          e.meta?.companyId === "company-a",
+      ),
+    ).toBe(true);
   });
 
   it("two companies each resolve their OWN live companyPolicies entry, not a value cached from the other's dispatch", async () => {
@@ -157,6 +245,9 @@ describe("vault config gates are re-read live on every dispatch (no setup-time c
         serviceAccountEmail: "svc@example.com",
         masterPasswordRef: "vault-master-password-secret",
         allowList: ["vault://EXAMPLE/svc-secrets/*"],
+        companyPolicies: {
+          "company-a": { allowList: ["vault://EXAMPLE/svc-secrets/*"] },
+        },
       });
 
       const after = await readTool("company-a", "vault://EXAMPLE/svc-secrets/tunnel-cert");
