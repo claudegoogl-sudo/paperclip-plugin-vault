@@ -1,6 +1,6 @@
 {
   "name": "@platform/paperclip-plugin-vault",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "packageManager": "pnpm@10.33.4",
   "type": "module",
   "private": true,
@@ -37,8 +37,8 @@
   "author": "Platform",
   "license": "MIT",
   "devDependencies": {
-    "@paperclipai/plugin-sdk": "file:.paperclip-sdk/paperclipai-plugin-sdk-2026.428.1-fork.11.tgz",
-    "@paperclipai/shared": "file:.paperclip-sdk/paperclipai-shared-2026.428.1-fork.11.tgz",
+    "@paperclipai/plugin-sdk": "file:.paperclip-sdk/paperclipai-plugin-sdk-2026.824.1-fork.42.tgz",
+    "@paperclipai/shared": "file:.paperclip-sdk/paperclipai-shared-2026.824.1-fork.42.tgz",
     "@types/node": "^24.6.0",
     "esbuild": "^0.27.3",
     "typescript": "^5.7.3",

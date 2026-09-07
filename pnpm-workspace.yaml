@@ -5,4 +5,4 @@ onlyBuiltDependencies:
   - esbuild
 
 overrides:
-  '@paperclipai/shared': 'file:.paperclip-sdk/paperclipai-shared-2026.428.1-fork.11.tgz'
+  '@paperclipai/shared': 'file:.paperclip-sdk/paperclipai-shared-2026.824.1-fork.42.tgz'

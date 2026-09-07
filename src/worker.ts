@@ -5,6 +5,7 @@ import type { VaultBackend } from "./worker/VaultBackend.js";
 import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
 import type { VaultRuntimeResult } from "./worker/vaultRuntime.js";
 import { raiseDeniedAlarmIfNew } from "./worker/deniedAlarm.js";
+import { resolveMasterPassword } from "./worker/secretRefBinding.js";
 
 interface VaultConfig {
   serverUrl?: string;
@@ -223,12 +224,10 @@ export function createVaultRuntimeResolver(
         // omitted, the server back-fills the plugin's own service-scope runId
         // and authorizes against the secret's owning company. Priming
         // (below) relies on that path.
+        // See `resolveMasterPassword` for why the call shape differs between
+        // the priming (no runId) and in-dispatch (runId) cases.
         resolvePassword: (runId) =>
-          runId === undefined
-            ? (
-                ctx.secrets.resolve as unknown as (ref: string) => Promise<string>
-              )(rawConfig.masterPasswordRef!)
-            : ctx.secrets.resolve(rawConfig.masterPasswordRef!, runId),
+          resolveMasterPassword(ctx.secrets, rawConfig.masterPasswordRef!, runId),
         http: ctx.http,
         logger: ctx.logger,
       });

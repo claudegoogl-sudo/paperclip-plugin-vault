@@ -32,7 +32,7 @@ function fakeCtx(config: Record<string, unknown>) {
   const ctx = {
     config: { get: async () => config },
     logger,
-    secrets: { resolve: async () => "unused-master-password" },
+    secrets: { resolve: async () => "unused-master-password", resolveService: async () => "unused-master-password" },
     http: {} as never,
     activity: { log: async () => {} },
     tools: {
