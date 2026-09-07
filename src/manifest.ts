@@ -93,10 +93,10 @@ const manifest: PaperclipPluginManifestV1 = {
         items: { type: "string" },
         minItems: 1,
         description:
-          "Vault refs (or glob patterns) this adapter instance is allowed " +
-          "to resolve. Patterns use `*` (one path segment) and `**` (any " +
-          "depth). Example: `vault://EXAMPLE/svc-secrets/*`. Enforced before " +
-          "any network call to Vaultwarden.",
+          "Required for worker activation, but grants nothing since 0.2.0: " +
+          "per-company grants come exclusively from `companyPolicies` " +
+          "entries, which never inherit this list. A non-empty value is " +
+          "still required to activate the worker.",
       },
       sessionTtlSeconds: {
         type: "integer",
@@ -131,25 +131,31 @@ const manifest: PaperclipPluginManifestV1 = {
               items: { type: "string" },
               minItems: 1,
               description:
-                "Vault refs/globs this company may resolve. Defaults to the " +
-                "instance-level `allowList` when omitted.",
+                "Required for any grant. The vault refs/globs this company " +
+                "may resolve — the entry REPLACES the instance-level list " +
+                "and entries never inherit it. An entry without `allowList` " +
+                "is denied (logged at error, at boot and on each call).",
             },
             handleMode: {
               type: "boolean",
               description:
-                "Override the instance-level `handleMode` for this company.",
+                "Borrowed-handle mode for this company. OFF when omitted — " +
+                "never inherited from the instance level.",
             },
           },
           additionalProperties: false,
         },
         description:
           "Per-company tenant scoping, keyed by Paperclip companyId. " +
-          "FAIL-CLOSED: when present and non-empty, ONLY listed companies " +
-          "may call the vault tools; every other company is denied before " +
-          "any parsing or network call. Each entry may narrow `allowList` " +
-          "(e.g. `vault://OTHER/**` for a second company) and override " +
-          "`handleMode`. When absent, the instance-level `allowList` and " +
-          "`handleMode` apply to all companies (legacy behaviour).",
+          "FAIL-CLOSED, entries are the ONLY grant source (since 0.2.0): a " +
+          "company may call the vault tools iff it is listed here with a " +
+          "non-empty `allowList`, and its grant is exactly that entry's " +
+          "list. When the map is absent or empty, EVERY company is denied " +
+          "(`vault.policymap_missing`); a listed entry without `allowList` " +
+          "denies that company (`vault.policy_entry_missing_allowlist`). " +
+          "Misconfiguration is surfaced loudly at worker start and on each " +
+          "denied call — never silently inherited from the instance-level " +
+          "`allowList`/`handleMode`.",
       },
     },
     required: ["serviceAccountEmail", "masterPasswordRef", "allowList"],

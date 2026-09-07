@@ -1,9 +1,9 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginLogger } from "@paperclipai/plugin-sdk";
 import { registerVaultTools } from "./worker/registerTools.js";
 import type { VaultBackend } from "./worker/VaultBackend.js";
 import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
-import type { VaultRuntimeResult } from "./worker/vaultRuntime.js";
+import type { VaultRuntimeOk, VaultRuntimeResult } from "./worker/vaultRuntime.js";
 import { raiseDeniedAlarmIfNew } from "./worker/deniedAlarm.js";
 import { resolveMasterPassword } from "./worker/secretRefBinding.js";
 
@@ -17,22 +17,40 @@ interface VaultConfig {
   allowedServerHosts?: string[];
   serviceAccountEmail?: string;
   masterPasswordRef?: string;
+  /**
+   * Instance-level vault ref patterns. Since 0.2.0 this is an ACTIVATION
+   * requirement only — a non-empty list is required to activate the worker
+   * (a worker that boots without one never registers working tools), but it
+   * grants nothing: per-company grants come exclusively from
+   * `companyPolicies` entries (see `policyFor` in
+   * worker/registerTools.ts). Never inherited by any company.
+   */
   allowList?: string[];
   sessionTtlSeconds?: number;
   /**
-   * Per-binding opt-in to borrowed-handle mode (borrowed-handle mode). When
-   * true, `vault.read` returns an opaque host-minted handle on both `content`
-   * and `data.value` instead of plaintext; the value resolves only when a
-   * downstream tool param routes through the host egress chokepoint. Defaults
-   * false so plaintext-reading consumers (e.g. the tunnel-cert sha256
-   * check) keep working until their binding opts in.
+   * Instance-level borrowed-handle flag. Since 0.2.0 it is NEVER inherited
+   * and has no runtime effect: `handleMode` comes only from each company's
+   * `companyPolicies` entry (omitted there = OFF). Kept in the config shape
+   * so existing instance configs continue to validate; setting it does
+   * nothing. See `policyFor` in worker/registerTools.ts.
    */
   handleMode?: boolean;
   /**
-   * Per-company policy keyed by Paperclip companyId. FAIL-CLOSED: when
-   * present and non-empty, only listed companies may call the vault tools;
-   * each entry may narrow `allowList` and override `handleMode` for that
-   * company. See registerTools.ts.
+   * Per-company policy keyed by Paperclip companyId — the ONLY grant source
+   * since 0.2.0. A company may call the vault tools iff it is listed here
+   * with a non-empty `allowList`, and its grant is exactly that entry's
+   * list: an entry REPLACES (never intersects or narrows) the instance-level
+   * list. FAIL-CLOSED on every drift shape:
+   * - map absent or empty → EVERY company is denied (`vault.policymap_missing`).
+   * - entry without `allowList` → that company is denied
+   *   (`vault.policy_entry_missing_allowlist`) — an entry never inherits the
+   *   instance-level list.
+   * - `handleMode` omitted in an entry = OFF, even when the instance-level
+   *   `handleMode` is true.
+   * Both drift shapes are surfaced loudly at boot (see `reportPolicyDrift`)
+   * and on each denied call (structured error events), and denied calls
+   * still produce the ordinary `denied_by_allowlist` audit row + alarm.
+   * See `policyFor` in worker/registerTools.ts.
    */
   companyPolicies?: Record<
     string,
@@ -294,6 +312,69 @@ export function createVaultRuntimeResolver(
   };
 }
 
+/**
+ * Boot-time misconfiguration sweep for the companyPolicies map. Pure: reads
+ * the freshly-resolved runtime and writes structured `error` events; never
+ * throws, never mutates, and (deliberately) never fails startup — config is
+ * re-read live on every dispatch, so a worker that boots with drifted config
+ * and is fixed later must self-heal (`tests/liveConfigReread.spec.ts`),
+ * and a startup failure would convert a config drift into a registration
+ * outage. The loud signal is the error events themselves, the per-call deny
+ * events, and the ordinary `denied_by_allowlist` audit/alarm path.
+ *
+ * Emits `vault.policymap_missing` when the map is absent or empty, and
+ * `vault.policy_entry_missing_allowlist` (once per bad entry, with
+ * `companyId`) for entries lacking an `allowList` — the two drift shapes
+ * that deny at call time. An operator whose edit broke tenant scoping sees
+ * the exact companyId at the next worker start without waiting for a denied
+ * call. Deliberately asymmetric with call-time enforcement: an entry with a
+ * present-but-empty `allowList` is schema-invalid (minItems 1) and denies
+ * by matching nothing, but is not a named drift event on either path.
+ */
+export function reportPolicyDrift(
+  runtime: Pick<VaultRuntimeOk, "companyPolicies" | "allowList">,
+  logger: PluginLogger,
+): void {
+  const missing = policyEntriesMissingAllowList(runtime.companyPolicies);
+  if (missing === null) {
+    logger.error("vault.policymap_missing", {
+      plugin: "platform.vault",
+      method: "setup",
+    });
+    return;
+  }
+  for (const companyId of missing) {
+    logger.error("vault.policy_entry_missing_allowlist", {
+      plugin: "platform.vault",
+      method: "setup",
+      companyId,
+    });
+  }
+}
+
+/**
+ * Shared misconfigured-entry predicate behind `reportPolicyDrift` and the
+ * ready log. Returns `null` when the map itself is absent/empty (drift
+ * shape A — the whole map is missing), otherwise the list of companyIds
+ * whose entries lack a usable `allowList` (drift shape B; an entry value
+ * that is not an object counts as lacking). An `allowList` present but not
+ * an array also counts as lacking; a present-but-empty array does not —
+ * it denies by matching nothing (same asymmetry as the call-time events).
+ */
+function policyEntriesMissingAllowList(
+  companyPolicies: VaultRuntimeOk["companyPolicies"],
+): string[] | null {
+  if (!companyPolicies || typeof companyPolicies !== "object") return null;
+  const entries = Object.entries(companyPolicies);
+  if (entries.length === 0) return null;
+  const missing: string[] = [];
+  for (const [companyId, entry] of entries) {
+    const allowList = (entry as { allowList?: unknown } | null)?.allowList;
+    if (!Array.isArray(allowList)) missing.push(companyId);
+  }
+  return missing;
+}
+
 export async function createVaultWorker(
   ctx: PluginContext,
   options: CreateVaultWorkerOptions = {},
@@ -311,10 +392,15 @@ export async function createVaultWorker(
       { reason: initial.error },
     );
   } else {
+    // Boot-time drift sweep: name misconfigured companyPolicies state in the
+    // log at startup so an operator sees the exact companyId without waiting
+    // for a denied call. Not a startup failure and not a health flip — see
+    // reportPolicyDrift.
+    reportPolicyDrift(initial, ctx.logger);
+    const missing = policyEntriesMissingAllowList(initial.companyPolicies);
     ctx.logger.info("paperclip-plugin-vault worker ready", {
-      allowListSize: initial.allowList.length,
-      handleMode: initial.handleMode,
       companyPolicyCount: Object.keys(initial.companyPolicies ?? {}).length,
+      misconfiguredPolicyEntries: missing === null ? 0 : missing.length,
     });
   }
 

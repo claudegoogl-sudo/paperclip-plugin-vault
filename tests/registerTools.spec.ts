@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  policyDenyMessage,
   registerVaultTools,
   type AuditRow,
   type VaultToolDependencies,
@@ -35,13 +36,29 @@ interface StaticRuntimeDeps {
 
 function withStaticRuntime(deps: StaticRuntimeDeps): VaultToolDependencies {
   const { backend, allowList, handleMode, companyPolicies, writeAudit, logger } = deps;
+  // Entries are the only grant source (0.2.0 semantics). Fixtures that do
+  // not spell out companyPolicies get their top-level allowList/handleMode
+  // wrapped as the dispatching company's entry, so the plumbing tests
+  // (grant, parse, audit, list filtering, handle minting) keep exercising
+  // the real entry path. Drift-shape tests pass `companyPolicies: undefined`
+  // (map absent), `{}` (map empty), or an entry without `allowList`
+  // explicitly.
+  const effectivePolicies =
+    "companyPolicies" in deps
+      ? companyPolicies
+      : {
+          [runCtx.companyId]: {
+            allowList: [...allowList],
+            handleMode: handleMode ?? false,
+          },
+        };
   return {
     resolveRuntime: async () => ({
       ok: true,
       backend,
       allowList,
       handleMode: handleMode ?? false,
-      companyPolicies,
+      companyPolicies: effectivePolicies,
     }),
     writeAudit,
     logger,
@@ -506,6 +523,263 @@ describe("error-string scrubbing (F8)", () => {
   });
 });
 
+describe("fail-closed policyFor (no top-level inheritance)", () => {
+  /** Backend that counts calls; any contact is a test failure signal. */
+  const countingBackend = () => {
+    const backend = {
+      reads: 0,
+      lists: 0,
+      async read() {
+        backend.reads += 1;
+        return "should-not-happen";
+      },
+      async list() {
+        backend.lists += 1;
+        return [];
+      },
+    };
+    return backend;
+  };
+
+  it("T1: denies vault.read when companyPolicies is absent — no top-level fallback, no backend contact", async () => {
+    const { ctx, tools, logs, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      // Adversarial top-level fields: any surviving inheritance path would
+      // turn this into a success.
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: undefined,
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const result = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    expect(result.error).toBe(policyDenyMessage("policymap_missing"));
+    expect(backend.reads).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({
+        outcome: "denied_by_allowlist",
+        companyId: "company-ccc",
+      }),
+    ]);
+    expect(
+      logs.some(
+        (e) => e.level === "error" && e.message === "vault.policymap_missing",
+      ),
+    ).toBe(true);
+  });
+
+  it("T2: denies vault.list (unscoped and globbed) when companyPolicies is absent", async () => {
+    const { ctx, tools, logs, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: undefined,
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const unscoped = await tools.get("vault.list")!.handler({}, runCtx);
+    expect(unscoped.error).toBe(policyDenyMessage("policymap_missing"));
+    const globbed = await tools
+      .get("vault.list")!
+      .handler({ collectionGlob: "vault://EXAMPLE/svc-secrets/*" }, runCtx);
+    expect(globbed.error).toBe(policyDenyMessage("policymap_missing"));
+    expect(backend.lists).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+    expect(
+      logs.filter(
+        (e) => e.level === "error" && e.message === "vault.policymap_missing",
+      ).length,
+    ).toBe(2);
+  });
+
+  it("T3/T4: denies read and list when companyPolicies is an empty map", async () => {
+    const { ctx, tools, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: {},
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const read = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    expect(read.error).toBe(policyDenyMessage("policymap_missing"));
+    const list = await tools.get("vault.list")!.handler({}, runCtx);
+    expect(list.error).toBe(policyDenyMessage("policymap_missing"));
+    expect(backend.reads).toBe(0);
+    expect(backend.lists).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+  });
+
+  it("T5: an entry without allowList denies read and names the drift event", async () => {
+    const { ctx, tools, logs, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: { "company-ccc": { handleMode: true } },
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const read = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    expect(read.error).toBe(policyDenyMessage("entry_missing_allowlist"));
+    expect(backend.reads).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+    const events = logs.filter(
+      (e) =>
+        e.level === "error" &&
+        e.message === "vault.policy_entry_missing_allowlist",
+    );
+    expect(events.length).toBe(1);
+    expect(events[0]!.meta).toMatchObject({ companyId: "company-ccc" });
+  });
+
+  it("T6: an entry without allowList denies list", async () => {
+    const { ctx, tools, logs, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: { "company-ccc": { handleMode: true } },
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const list = await tools.get("vault.list")!.handler({}, runCtx);
+    expect(list.error).toBe(policyDenyMessage("entry_missing_allowlist"));
+    expect(backend.lists).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+  });
+
+  it("T7: handleMode absent in the entry is OFF even when the instance-level handleMode is true", async () => {
+    const { ctx, tools } = makeFakeCtx({
+      mintHandle: async () => {
+        throw new Error("mintHandle must never be called");
+      },
+    });
+    const backend = new InMemoryVaultBackend();
+    backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "pat" }, "secret-a");
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      handleMode: true,
+      companyPolicies: { "company-ccc": { allowList: ["vault://EXAMPLE/**"] } },
+      writeAudit: async () => {},
+      logger: ctx.logger,
+    }));
+    const result = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    // PLAINTEXT — the entry is authoritative; the instance flag is dead.
+    expect(result.content).toBe("secret-a");
+    expect(result.data).toEqual({
+      value: "secret-a",
+      ref: "vault://EXAMPLE/svc-secrets/pat",
+    });
+  });
+
+  it("T8: the entry allowList REPLACES the instance list — outside-entry refs are denied even when the instance list matches", async () => {
+    const { ctx, tools, audits } = makeFakeCtx();
+    const backend = new InMemoryVaultBackend();
+    backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "pat" }, "secret-a");
+    backend.set({ org: "OTHER", collection: "ci", item: "pat-b" }, "secret-b");
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      companyPolicies: {
+        "company-ccc": { allowList: ["vault://EXAMPLE/svc-secrets/*"] },
+      },
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const read = tools.get("vault.read")!;
+    const inside = await read.handler(
+      { secretRef: "vault://EXAMPLE/svc-secrets/pat" },
+      runCtx,
+    );
+    expect(inside.content).toBe("secret-a");
+    const outsideButInstanceMatch = await read.handler(
+      { secretRef: "vault://OTHER/ci/pat-b" },
+      runCtx,
+    );
+    expect(outsideButInstanceMatch.error).toMatch(
+      /is not in this adapter's allowList/,
+    );
+    expect(audits.map((a) => a.outcome)).toEqual([
+      "success",
+      "denied_by_allowlist",
+    ]);
+  });
+
+  it("T9: an empty entry allowList denies by matching nothing (schema-independent)", async () => {
+    const { ctx, tools, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      companyPolicies: { "company-ccc": { allowList: [] } },
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const read = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    expect(read.error).toMatch(/is not in this adapter's allowList/);
+    expect(backend.reads).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+  });
+
+  it("T10: an invalid entry pattern denies loudly via the existing compile-failed event", async () => {
+    const { ctx, tools, logs, audits } = makeFakeCtx();
+    const backend = countingBackend();
+    registerVaultTools(ctx as never, withStaticRuntime({
+      backend,
+      allowList: ["vault://**"],
+      companyPolicies: { "company-ccc": { allowList: ["no-vault-prefix"] } },
+      writeAudit: async (e) => void audits.push(e),
+      logger: ctx.logger,
+    }));
+    const read = await tools
+      .get("vault.read")!
+      .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, runCtx);
+    expect(read.error).toBe(policyDenyMessage("allowlist_compile_failed"));
+    expect(backend.reads).toBe(0);
+    expect(audits).toEqual([
+      expect.objectContaining({ outcome: "denied_by_allowlist" }),
+    ]);
+    expect(
+      logs.some(
+        (e) =>
+          e.level === "error" && e.message === "vault.allowlist_compile_failed",
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("companyPolicies (fail-closed tenant scoping)", () => {
   const makePolicyFixture = () => {
     const { ctx, tools, audits } = makeFakeCtx({
@@ -570,19 +844,35 @@ describe("companyPolicies (fail-closed tenant scoping)", () => {
     expect(listA.data).toEqual({ names: ["pat"] });
   });
 
-  it("keeps legacy instance-wide behaviour when companyPolicies is absent", async () => {
-    const { ctx, tools, audits } = makeFakeCtx();
+  it("denies every company when companyPolicies is absent (no legacy instance-wide grant)", async () => {
+    // Pre-0.2.0 this asserted SUCCESS via the top-level allowList fallback.
+    // Inversion is the point: the instance-level list grants nothing now —
+    // an absent map denies every company, loudly.
+    const { ctx, tools, logs, audits } = makeFakeCtx();
     const backend = new InMemoryVaultBackend();
     backend.set({ org: "EXAMPLE", collection: "svc-secrets", item: "pat" }, "secret-a");
     registerVaultTools(ctx as never, withStaticRuntime({
       backend,
       allowList: ["vault://EXAMPLE/**"],
+      companyPolicies: undefined,
       writeAudit: async (e) => void audits.push(e),
       logger: ctx.logger,
     }));
     const result = await tools
       .get("vault.read")!
       .handler({ secretRef: "vault://EXAMPLE/svc-secrets/pat" }, ctxFor("any-company"));
-    expect(result.content).toBe("secret-a");
+    expect(result.error).toBe(policyDenyMessage("policymap_missing"));
+    expect(result.content).toBeUndefined();
+    expect(audits).toEqual([
+      expect.objectContaining({
+        outcome: "denied_by_allowlist",
+        companyId: "any-company",
+      }),
+    ]);
+    expect(
+      logs.some(
+        (e) => e.level === "error" && e.message === "vault.policymap_missing",
+      ),
+    ).toBe(true);
   });
 });
