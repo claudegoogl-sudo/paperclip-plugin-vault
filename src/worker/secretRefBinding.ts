@@ -4,8 +4,46 @@ import type { EnvSecretRefBinding, PluginContext } from "@paperclipai/plugin-sdk
  * Wrap a stored (legacy, bare-UUID) Paperclip secret-ref string into the
  * shared `{ type: "secret_ref", secretId, version? }` object binding shape.
  */
-export function toSecretRefBinding(secretRef: string): EnvSecretRefBinding {
-  return { type: "secret_ref", secretId: secretRef };
+export function toSecretRefBinding(
+  secretRef: MasterPasswordRef,
+): EnvSecretRefBinding {
+  if (typeof secretRef === "string") {
+    return { type: "secret_ref", secretId: secretRef };
+  }
+  if (
+    secretRef === null ||
+    typeof secretRef !== "object" ||
+    secretRef.type !== "secret_ref" ||
+    typeof secretRef.secretId !== "string" ||
+    secretRef.secretId.length === 0
+  ) {
+    throw new Error(
+      'masterPasswordRef must be a secret UUID string or { type: "secret_ref", secretId, version? }',
+    );
+  }
+  // Re-build instead of passing through: never double-wrap, never forward
+  // unknown fields.
+  const binding: EnvSecretRefBinding = {
+    type: "secret_ref",
+    secretId: secretRef.secretId,
+  };
+  if (secretRef.version !== undefined) {
+    (binding as { version?: unknown }).version = secretRef.version;
+  }
+  return binding;
+}
+
+/**
+ * Stored config shape for `masterPasswordRef`: the legacy bare secret UUID
+ * string, or the shared `{ type: "secret_ref", secretId, version? }` object.
+ */
+export type MasterPasswordRef =
+  | string
+  | { type: "secret_ref"; secretId: string; version?: number | "latest" };
+
+/** Stable identity key for config-change detection (string vs object differ). */
+export function masterPasswordRefKey(ref: MasterPasswordRef | undefined): string | undefined {
+  return ref === undefined ? undefined : JSON.stringify(ref);
 }
 
 /**
@@ -27,10 +65,11 @@ export function toSecretRefBinding(secretRef: string): EnvSecretRefBinding {
  */
 export function resolveMasterPassword(
   secrets: Pick<PluginContext["secrets"], "resolve" | "resolveService">,
-  masterPasswordRef: string,
+  masterPasswordRef: MasterPasswordRef,
   runId: string | undefined,
 ): Promise<string> {
+  const binding = toSecretRefBinding(masterPasswordRef);
   return runId === undefined
-    ? secrets.resolveService(masterPasswordRef)
-    : secrets.resolve(toSecretRefBinding(masterPasswordRef), { runId });
+    ? secrets.resolveService(binding.secretId)
+    : secrets.resolve(binding, { runId });
 }

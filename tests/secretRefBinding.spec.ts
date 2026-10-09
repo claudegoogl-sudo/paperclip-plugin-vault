@@ -85,3 +85,44 @@ describe("resolveMasterPassword (secret-ref call shape)", () => {
     });
   });
 });
+
+describe("resolveMasterPassword — object-shaped stored masterPasswordRef", () => {
+  const ID = "11111111-2222-4333-8444-555555555555";
+  const OBJ = { type: "secret_ref" as const, secretId: ID };
+
+  it("in-dispatch: object config is NOT double-wrapped", async () => {
+    const host = fakeHostSecretsClient();
+    await expect(resolveMasterPassword(host, OBJ, "run-1")).resolves.toBe(
+      "unlocked-master-password",
+    );
+    expect(host.resolveCalls).toEqual([
+      { secretRef: { type: "secret_ref", secretId: ID }, options: { runId: "run-1" } },
+    ]);
+  });
+
+  it("priming: object config hands resolveService the bare secret id", async () => {
+    const host = fakeHostSecretsClient();
+    await expect(resolveMasterPassword(host, OBJ, undefined)).resolves.toBe(
+      "unlocked-master-password",
+    );
+    expect(host.resolveServiceCalls).toEqual([{ secretRef: ID }]);
+  });
+
+  it("string config still resolves on both branches (backward compat)", async () => {
+    const host = fakeHostSecretsClient();
+    await resolveMasterPassword(host, ID, "run-1");
+    await resolveMasterPassword(host, ID, undefined);
+    expect(host.resolveCalls).toEqual([
+      { secretRef: { type: "secret_ref", secretId: ID }, options: { runId: "run-1" } },
+    ]);
+    expect(host.resolveServiceCalls).toEqual([{ secretRef: ID }]);
+  });
+
+  it("keeps version, drops unknown fields, rejects malformed objects", () => {
+    expect(
+      toSecretRefBinding({ ...OBJ, version: 3, extra: "x" } as never),
+    ).toEqual({ type: "secret_ref", secretId: ID, version: 3 });
+    expect(() => toSecretRefBinding({ type: "nope", secretId: ID } as never)).toThrow();
+    expect(() => toSecretRefBinding({ type: "secret_ref" } as never)).toThrow();
+  });
+});
