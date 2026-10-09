@@ -5,7 +5,11 @@ import type { VaultBackend } from "./worker/VaultBackend.js";
 import { VaultwardenBackend } from "./worker/VaultwardenBackend.js";
 import type { VaultRuntimeOk, VaultRuntimeResult } from "./worker/vaultRuntime.js";
 import { raiseDeniedAlarmIfNew } from "./worker/deniedAlarm.js";
-import { resolveMasterPassword } from "./worker/secretRefBinding.js";
+import {
+  masterPasswordRefKey,
+  resolveMasterPassword,
+  type MasterPasswordRef,
+} from "./worker/secretRefBinding.js";
 
 interface VaultConfig {
   serverUrl?: string;
@@ -16,7 +20,7 @@ interface VaultConfig {
    */
   allowedServerHosts?: string[];
   serviceAccountEmail?: string;
-  masterPasswordRef?: string;
+  masterPasswordRef?: MasterPasswordRef;
   /**
    * Instance-level vault ref patterns. Since 0.2.0 this is an ACTIVATION
    * requirement only — a non-empty list is required to activate the worker
@@ -69,7 +73,7 @@ interface BackendIdentity {
   serverUrl: string;
   allowedServerHosts: string[] | undefined;
   serviceAccountEmail: string | undefined;
-  masterPasswordRef: string | undefined;
+  masterPasswordRef: string | undefined; // masterPasswordRefKey()
   sessionTtlSeconds: number;
 }
 
@@ -78,7 +82,7 @@ function backendIdentityOf(config: Partial<VaultConfig>): BackendIdentity {
     serverUrl: config.serverUrl ?? DEFAULT_SERVER_URL,
     allowedServerHosts: config.allowedServerHosts,
     serviceAccountEmail: config.serviceAccountEmail,
-    masterPasswordRef: config.masterPasswordRef,
+    masterPasswordRef: masterPasswordRefKey(config.masterPasswordRef),
     sessionTtlSeconds: config.sessionTtlSeconds ?? 3600,
   };
 }

@@ -79,14 +79,44 @@ const manifest: PaperclipPluginManifestV1 = {
           "Must be invited to the target organization with read access to " +
           "every collection covered by `allowList`. See README for setup.",
       },
+      // DISCOVERY INVARIANT: the host's secret-ref collector reads
+      // `format: "secret-ref"` on the property node itself, never on a
+      // oneOf branch. Keep `format` here alongside the union.
       masterPasswordRef: {
-        type: "string",
         format: "secret-ref",
         description:
           "Paperclip secret reference for the service account's master " +
-          "password. Resolved per unlock via ctx.secrets.resolve; never " +
-          "logged. Plugin uses this to PBKDF2-derive the master key and " +
-          "obtain an access token + the user's encryption key.",
+          "password: the secret UUID string or a " +
+          "{ type: \"secret_ref\", secretId, version? } object. Resolved per " +
+          "unlock via ctx.secrets; never logged. Plugin uses this to " +
+          "PBKDF2-derive the master key and obtain an access token + the " +
+          "user's encryption key.",
+        oneOf: [
+          {
+            type: "string",
+            format: "secret-ref",
+            description: "Legacy shape: bare secret UUID.",
+          },
+          {
+            type: "object",
+            properties: {
+              type: { const: "secret_ref" },
+              secretId: {
+                type: "string",
+                format: "uuid",
+                description: "Paperclip secret UUID.",
+              },
+              version: {
+                oneOf: [
+                  { type: "integer", minimum: 1 },
+                  { const: "latest" },
+                ],
+              },
+            },
+            required: ["type", "secretId"],
+            additionalProperties: false,
+          },
+        ],
       },
       allowList: {
         type: "array",
