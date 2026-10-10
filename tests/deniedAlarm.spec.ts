@@ -22,7 +22,7 @@ function makeRow(overrides: Partial<AuditRow> = {}): AuditRow {
     agentId: "agent-aaa-1111-2222-3333",
     runId: "run-bbb-4444-5555-6666",
     companyId: "company-ccc-7777-8888",
-    secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
+    vaultRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
     outcome: "denied_by_allowlist",
     ...overrides,
   };
@@ -104,19 +104,19 @@ describe("raiseDeniedAlarmIfNew — outcomes", () => {
     expect(deps.setState).toHaveBeenCalledTimes(1);
   });
 
-  it("creates SEPARATE alarm issues when EITHER agentId or secretRef differs", async () => {
+  it("creates SEPARATE alarm issues when EITHER agentId or vaultRef differs", async () => {
     const deps = makeDeps();
     await raiseDeniedAlarmIfNew(deps, makeRow({
       agentId: "agent-A",
-      secretRef: "vault://EXAMPLE/svc-secrets/a",
+      vaultRef: "vault://EXAMPLE/svc-secrets/a",
     }));
     await raiseDeniedAlarmIfNew(deps, makeRow({
       agentId: "agent-A",
-      secretRef: "vault://EXAMPLE/svc-secrets/b",
+      vaultRef: "vault://EXAMPLE/svc-secrets/b",
     }));
     await raiseDeniedAlarmIfNew(deps, makeRow({
       agentId: "agent-B",
-      secretRef: "vault://EXAMPLE/svc-secrets/a",
+      vaultRef: "vault://EXAMPLE/svc-secrets/a",
     }));
     expect(deps.parts.createdIssues).toHaveLength(3);
     expect(deps.parts.createdIssues.map((i) => i.title)).toEqual([
@@ -130,7 +130,7 @@ describe("raiseDeniedAlarmIfNew — outcomes", () => {
     const deps = makeDeps();
     const row = makeRow({
       operation: "list",
-      secretRef: "vault://OTHER/svc-secrets/*",
+      vaultRef: "vault://OTHER/svc-secrets/*",
     });
     const result = await raiseDeniedAlarmIfNew(deps, row);
     expect(result).toBe("issue-001");
@@ -145,14 +145,14 @@ describe("raiseDeniedAlarmIfNew — alarm payload", () => {
       agentId: "agent-FULL-ID-1234",
       runId: "run-FULL-RUN-5678",
       companyId: "company-FULL-9012",
-      secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
+      vaultRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
     });
     await raiseDeniedAlarmIfNew(deps, row);
     const body = deps.parts.createdIssues[0]?.description ?? "";
     expect(body).toContain("agentId: agent-FULL-ID-1234");
     expect(body).toContain("runId: run-FULL-RUN-5678");
     expect(body).toContain("companyId: company-FULL-9012");
-    expect(body).toContain("secretRef: vault://EXAMPLE/svc-secrets/tunnel-cert");
+    expect(body).toContain("vaultRef: vault://EXAMPLE/svc-secrets/tunnel-cert");
   });
 
   it("NEVER carries a resolved value — there is no value field on AuditRow and the description is built only from safe metadata", async () => {
@@ -179,10 +179,10 @@ describe("raiseDeniedAlarmIfNew — alarm payload", () => {
         `- agentId: ${row.agentId}`,
         `- runId: ${row.runId}`,
         `- companyId: ${row.companyId}`,
-        `- secretRef: ${row.secretRef}`,
+        `- vaultRef: ${row.vaultRef}`,
         `- operation: ${row.operation}`,
         "",
-        "Repeated denials of the same (agentId, secretRef) collapse into this single issue.",
+        "Repeated denials of the same (agentId, vaultRef) collapse into this single issue.",
         "Update the adapter's `allowList` (or `companyPolicies` entry for this company) to grant access,",
         "or confirm the agent should not be reading this ref and close this issue.",
       ].join("\n"),
@@ -192,7 +192,7 @@ describe("raiseDeniedAlarmIfNew — alarm payload", () => {
   it("truncates the ref in the title for readability but keeps it whole in the description", async () => {
     const deps = makeDeps();
     const longRef = `vault://EXAMPLE/long-collection/${"x".repeat(120)}`;
-    const row = makeRow({ secretRef: longRef });
+    const row = makeRow({ vaultRef: longRef });
     await raiseDeniedAlarmIfNew(deps, row);
     const title = deps.parts.createdIssues[0]?.title ?? "";
     expect(title.length).toBeLessThan(160);
@@ -283,7 +283,7 @@ describe("alarmIssueTitle / alarmIssueDescription — pure helpers", () => {
       .filter((l) => /^- /.test(l))
       .map((l) => l.replace(/^- ([\w_]+):.*/, "$1"));
     expect(fieldLines.sort()).toEqual(
-      ["agentId", "companyId", "operation", "runId", "secretRef"].sort(),
+      ["agentId", "companyId", "operation", "runId", "vaultRef"].sort(),
     );
   });
 });

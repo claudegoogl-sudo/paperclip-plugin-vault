@@ -425,21 +425,21 @@ function makeActivityAudit(
     await ctx.activity.log({
       companyId: entry.companyId,
       entityType: tool,
-      entityId: entry.secretRef,
+      entityId: entry.vaultRef,
       message: `${tool} ${entry.outcome}`,
       metadata: {
         agentId: entry.agentId,
         runId: entry.runId,
         operation: entry.operation,
         outcome: entry.outcome,
-        secretRef: entry.secretRef,
+        vaultRef: entry.vaultRef,
         ...(entry.error ? { error: entry.error } : {}),
       },
     });
     // Denied-by-allowList rows additionally raise an idempotent Paperclip
     // issue so the platform team sees them within hours, not on a fortnightly
     // audit-review cadence. The row already carries every field the alarm
-    // needs (agentId, runId, companyId, secretRef) — we do NOT widen what the
+    // needs (agentId, runId, companyId, vaultRef) — we do NOT widen what the
     // plugin logs to drive this; the alarm consumes the existing row. The
     // alarm fires after the audit row is durably written so a state or issue
     // failure never loses the audit record. Best-effort: errors are caught
