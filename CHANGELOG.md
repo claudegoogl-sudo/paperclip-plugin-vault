@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.2
+
+- Audit rows now store the ref under `vaultRef` (was `secretRef`). The host
+  activity sanitizer redacts any metadata key whose name contains `secret`,
+  so every row showed `***REDACTED***` instead of the ref. The activity
+  `entityId`, the denied-alarm issue body and the alarm log fields use the
+  same name. The denied-alarm state key format is unchanged, so alarms raised
+  by 0.2.1 still dedupe.
+- Only a ref that has the `vault://<org>/<collection>/<item>` shape and parses
+  is stored in clear (list: a `vault://<org>/<collection>/*` glob). Anything
+  else is stored as `(invalid)`, so caller input is never echoed into the
+  audit trail.
+- `vault.read` with a missing or non-string `secretRef` (for example
+  `{ ref: ... }`) no longer throws (a host 500). It returns an
+  `invalid_params: ...` tool error, the same client-error shape as
+  `invalid_ref`, and writes an audit row with outcome `invalid_params`.
+
 ## 0.2.0
 
 **Breaking (config semantics):** `companyPolicies` entries are the only

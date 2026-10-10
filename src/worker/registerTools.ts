@@ -42,11 +42,22 @@ export interface AuditRow {
   agentId: string;
   runId: string;
   companyId: string;
-  /** For `read` the requested ref; for `list` the requested glob (or a
-   * scope sentinel when unscoped). Never a secret value. */
-  secretRef: string;
+  /**
+   * For `read` the requested ref; for `list` the requested glob (or a scope
+   * sentinel when unscoped). Never a secret value.
+   *
+   * Keyed `vaultRef`, not `secretRef`: the host runs its activity sanitizer
+   * over audit metadata and redacts the value of any key whose NAME matches
+   * its secret-field pattern (anything containing "secret"). Under the old
+   * key every row read `***REDACTED***` and the trail could not say which
+   * ref was read or denied. Only a value that passed {@link auditRefFor} /
+   * {@link auditGlobFor} is stored here; anything else is a fixed marker,
+   * so arbitrary caller input (possibly a pasted secret) is never echoed.
+   */
+  vaultRef: string;
   outcome:
     | "success"
+    | "invalid_params"
     | "denied_by_allowlist"
     | "invalid_ref"
     | "not_found"
@@ -228,8 +239,15 @@ export function registerVaultTools(
         agentId: runCtx.agentId,
         runId: runCtx.runId,
         companyId: runCtx.companyId,
-        secretRef,
+        vaultRef: auditRefFor(secretRef),
       };
+      if (secretRef === null) {
+        // Wrong/missing param (e.g. `{ref: ...}`): a caller error, not a
+        // worker crash. Audit it and return a client-error result instead of
+        // throwing (a throw surfaces as a host 500). No input is echoed.
+        await safeAudit(writeAudit, logger, { ...baseAudit, outcome: "invalid_params" });
+        return { error: INVALID_READ_PARAMS_ERROR };
+      }
 
       const runtime = await resolveRuntime("read");
       if (!runtime.ok) {
@@ -342,7 +360,7 @@ export function registerVaultTools(
         companyId: runCtx.companyId,
         // No-glob lists are scoped by the allowList post-filter below; record
         // the requested glob, or a sentinel when the caller passed none.
-        secretRef: glob ?? "(no glob: allowList scopes)",
+        vaultRef: auditGlobFor(glob),
       };
 
       const runtime = await resolveRuntime("list");
@@ -421,15 +439,42 @@ export function registerVaultTools(
   );
 }
 
-function readSecretRefParam(params: unknown): string {
-  if (!params || typeof params !== "object") {
-    throw new Error("invalid_params: expected object");
-  }
-  const ref = (params as { secretRef?: unknown }).secretRef;
-  if (typeof ref !== "string") {
-    throw new Error("invalid_params: secretRef must be a string");
+export const INVALID_READ_PARAMS_ERROR =
+  "invalid_params: vault.read expects { secretRef: \"vault://<org>/<collection>/<item>\" }";
+
+/** Marker stored in audit rows in place of a ref that failed validation. */
+export const AUDIT_INVALID_REF = "(invalid)";
+/** Marker stored in `vault.list` audit rows when no glob was passed. */
+export const AUDIT_NO_GLOB = "(no glob: allowList scopes)";
+
+const VAULT_REF_SHAPE = /^vault:\/\/[^/]+\/[^/]+\/[^/]+$/;
+const VAULT_GLOB_SHAPE = /^vault:\/\/[^/]+\/[^/]+\/[*]$/;
+
+/**
+ * The value stored as `vaultRef` on a `vault.read` audit row: the ref itself
+ * only when it has the schema shape (and parses), else a fixed marker.
+ */
+export function auditRefFor(ref: string | null): string {
+  if (ref === null || !VAULT_REF_SHAPE.test(ref)) return AUDIT_INVALID_REF;
+  try {
+    parseVaultRef(ref);
+  } catch {
+    return AUDIT_INVALID_REF;
   }
   return ref;
+}
+
+/** Same rule as {@link auditRefFor} for a `vault.list` glob. */
+export function auditGlobFor(glob: string | null): string {
+  if (glob === null) return AUDIT_NO_GLOB;
+  return VAULT_GLOB_SHAPE.test(glob) ? glob : AUDIT_INVALID_REF;
+}
+
+/** Returns the `secretRef` param, or null when absent / not a string. */
+function readSecretRefParam(params: unknown): string | null {
+  if (!params || typeof params !== "object") return null;
+  const ref = (params as { secretRef?: unknown }).secretRef;
+  return typeof ref === "string" ? ref : null;
 }
 
 function readListGlobParam(params: unknown): string | null {
@@ -471,7 +516,7 @@ async function safeAudit(
     // Audit failures must not break the tool call but should be loud.
     logger.error("vault.audit_write_failed", {
       outcome: entry.outcome,
-      secretRef: entry.secretRef,
+      vaultRef: entry.vaultRef,
       error: String(err instanceof Error ? err.message : err),
     });
   }

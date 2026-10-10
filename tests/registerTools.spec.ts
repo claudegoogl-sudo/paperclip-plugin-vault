@@ -136,7 +136,7 @@ describe("vault.read tool", () => {
         agentId: "agent-aaa",
         runId: "run-bbb",
         companyId: "company-ccc",
-        secretRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
+        vaultRef: "vault://EXAMPLE/svc-secrets/tunnel-cert",
       }),
     ]);
   });

@@ -2,14 +2,14 @@ import type { AuditRow } from "./registerTools.js";
 
 /**
  * `denied_by_allowlist` alarm — idempotent Paperclip issue per
- * (agentId, secretRef) tuple.
+ * (agentId, vaultRef) tuple.
  *
  * When the vault tools deny a read or list call because the ref is outside
  * the allowList (or because no company policy is configured for the calling
  * company), the audit row already carries everything needed to alert on
- * (agentId, runId, companyId, secretRef). This module consumes that row and
+ * (agentId, runId, companyId, vaultRef). This module consumes that row and
  * raises a Paperclip issue in the dispatching company's tenant on the FIRST
- * denial for a given (agentId, secretRef) tuple. Subsequent denials of the
+ * denial for a given (agentId, vaultRef) tuple. Subsequent denials of the
  * same tuple collapse into the existing issue — they do not spam.
  *
  * The alarm never carries a resolved value. {@link AuditRow} does not have a
@@ -30,15 +30,15 @@ export const ALARM_ISSUE_TITLE_PREFIX = "platform.vault: denied_by_allowlist";
  * Build the deterministic title for an alarm issue. Pure function so tests
  * can assert on it and operators can search for it.
  *
- * The title never carries the value; only the (agentId, secretRef) tuple.
+ * The title never carries the value; only the (agentId, vaultRef) tuple.
  * The agentId is truncated to its first 8 chars to keep the title readable
  * — the full agentId is in the description body.
  */
 export function alarmIssueTitle(row: AuditRow): string {
   const agentShort = row.agentId.slice(0, 8);
-  const refTrunc = row.secretRef.length > 80
-    ? `${row.secretRef.slice(0, 77)}…`
-    : row.secretRef;
+  const refTrunc = row.vaultRef.length > 80
+    ? `${row.vaultRef.slice(0, 77)}…`
+    : row.vaultRef;
   return `${ALARM_ISSUE_TITLE_PREFIX} — agent=${agentShort}… ref=${refTrunc}`;
 }
 
@@ -48,7 +48,7 @@ export function alarmIssueTitle(row: AuditRow): string {
  * value-leaking edit fails the test.
  *
  * The body lists exactly the four required fields (agentId, runId,
- * companyId, secretRef) plus the operation (`read` or `list`). It never
+ * companyId, vaultRef) plus the operation (`read` or `list`). It never
  * reads any field that could carry a value, because {@link AuditRow}
  * does not have one.
  */
@@ -60,10 +60,10 @@ export function alarmIssueDescription(row: AuditRow): string {
     `- agentId: ${row.agentId}`,
     `- runId: ${row.runId}`,
     `- companyId: ${row.companyId}`,
-    `- secretRef: ${row.secretRef}`,
+    `- vaultRef: ${row.vaultRef}`,
     `- operation: ${row.operation}`,
     "",
-    "Repeated denials of the same (agentId, secretRef) collapse into this single issue.",
+    "Repeated denials of the same (agentId, vaultRef) collapse into this single issue.",
     "Update the adapter's `allowList` (or `companyPolicies` entry for this company) to grant access,",
     "or confirm the agent should not be reading this ref and close this issue.",
   ].join("\n");
@@ -101,26 +101,26 @@ export interface DeniedAlarmDeps {
 }
 
 /**
- * Build the deterministic state key for a (agentId, secretRef) tuple. The
+ * Build the deterministic state key for a (agentId, vaultRef) tuple. The
  * key is what `getState`/`setState` see — production prefixes it with the
  * company scope + `denied-alarms` namespace, so the raw key here is just
  * the agent + ref fingerprint.
  *
- * The agentId is a UUID (fixed shape). The secretRef is a vault ref like
+ * The agentId is a UUID (fixed shape). The vaultRef is a vault ref like
  * `vault://ORG/COLLECTION/ITEM` or the list sentinel
  * `(no glob: allowList scopes)`; we keep the readable shape and only
  * escape characters that would corrupt a state key, then cap length so a
  * hostile ref can't blow up the key.
  */
-export function alarmStateKey(agentId: string, secretRef: string): string {
-  const safeRef = secretRef.replace(/[^\w:/.*\[\]-]/g, "_").slice(0, 120);
+export function alarmStateKey(agentId: string, vaultRef: string): string {
+  const safeRef = vaultRef.replace(/[^\w:/.*\[\]-]/g, "_").slice(0, 120);
   return `denied:${agentId}:${safeRef}`;
 }
 
 /**
  * Raise the alarm for an audit row IF AND ONLY IF the row's outcome is
  * `denied_by_allowlist` and no alarm has been raised yet for the row's
- * (agentId, secretRef) tuple.
+ * (agentId, vaultRef) tuple.
  *
  * Returns the issueId of the alarm issue (existing or newly created), or
  * `null` when no alarm was raised (non-deny row, state read confirmed an
@@ -145,7 +145,7 @@ export async function raiseDeniedAlarmIfNew(
     });
   }
 
-  const key = alarmStateKey(row.agentId, row.secretRef);
+  const key = alarmStateKey(row.agentId, row.vaultRef);
 
   let priorIssueId: string | null = null;
   try {
@@ -161,7 +161,7 @@ export async function raiseDeniedAlarmIfNew(
   } catch (err) {
     deps.log("warn", "vault.denied_alarm_state_read_failed", {
       agentId: row.agentId,
-      secretRef: row.secretRef,
+      vaultRef: row.vaultRef,
       error: String(err instanceof Error ? err.message : err),
     });
     // Continue: try to create the issue anyway. Idempotency is best-effort;
@@ -188,7 +188,7 @@ export async function raiseDeniedAlarmIfNew(
       deps.log("warn", "vault.denied_alarm_state_write_failed", {
         issueId: issue.id,
         agentId: row.agentId,
-        secretRef: row.secretRef,
+        vaultRef: row.vaultRef,
         error: String(err instanceof Error ? err.message : err),
       });
     }
@@ -196,7 +196,7 @@ export async function raiseDeniedAlarmIfNew(
   } catch (err) {
     deps.log("error", "vault.denied_alarm_create_failed", {
       agentId: row.agentId,
-      secretRef: row.secretRef,
+      vaultRef: row.vaultRef,
       error: String(err instanceof Error ? err.message : err),
     });
     return null;
